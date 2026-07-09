@@ -59,7 +59,7 @@ DEFAULT_PROFILE_PROVIDER = 'agentrouter'
 CLI_COMMAND = 'checkin-agentrouter'
 GITHUB_LOGIN_URL = 'https://github.com/login'
 GITHUB_PROFILE_URL = 'https://github.com/settings/profile'
-NOTIFICATION_TITLE = 'AnyRouter Check-in'
+NOTIFICATION_TITLE = 'AgentRouter Check-in'
 
 
 def load_balance_hash():

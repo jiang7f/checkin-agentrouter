@@ -119,7 +119,7 @@ checkin-agentrouter
 通知标题：
 
 ```text
-AnyRouter Check-in
+AgentRouter Check-in
 ```
 
 通知示例：
