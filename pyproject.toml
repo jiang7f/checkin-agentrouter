@@ -1,0 +1,70 @@
+[project]
+name = "checkin-agentrouter"
+version = "0.1.0"
+description = "Local AgentRouter daily check-in automation"
+requires-python = ">=3.11"
+dependencies = [
+  "httpx[http2]>=0.24.0",
+  "cloakbrowser>=0.3.0",
+  "python-dotenv>=1.0.0"
+]
+
+[dependency-groups]
+dev = [
+  "pytest>=7.4.0",
+  "pytest-mock>=3.11.1",
+  "pytest-cov>=4.1.0",
+  "pytest-asyncio>=0.21.0",
+  "python-dotenv>=1.0.0",
+  "ruff>=0.1.0"
+]
+
+[tool.ruff]
+line-length = 120
+fix = true
+
+[tool.ruff.lint]
+select = ["ASYNC", "E", "F", "FAST", "I", "PLE"]
+ignore = ["ASYNC109", "ASYNC230", "E101", "E402", "E501", "F841", "E731"]
+unfixable = ["E101", "E402", "E501", "F841", "E731"]
+
+[tool.ruff.format]
+quote-style = "single"
+indent-style = "tab"
+docstring-code-format = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = [
+  "--cov=.",
+  "--cov-report=term-missing",
+  "--cov-report=html",
+  "--cov-report=xml",
+  "--cov-branch",
+  "-v"
+]
+asyncio_mode = "auto"
+
+[tool.coverage.run]
+source = ["."]
+omit = [
+  "tests/*",
+  ".venv/*",
+  "venv/*",
+  "*/site-packages/*"
+]
+
+[tool.coverage.report]
+exclude_lines = [
+  "pragma: no cover",
+  "def __repr__",
+  "raise AssertionError",
+  "raise NotImplementedError",
+  "if __name__ == .__main__.:",
+  "if TYPE_CHECKING:",
+  "class .*\\bProtocol\\):",
+  "@(abc\\.)?abstractmethod"
+]
