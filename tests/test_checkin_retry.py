@@ -34,6 +34,21 @@ async def test_check_in_account_with_retries_stops_after_success(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_check_in_account_with_retries_emits_step_zero_before_retry(monkeypatch):
+	step_updates = []
+
+	async def fake_check_in_account(account, account_index, app_config):
+		return False, None, None
+
+	monkeypatch.setattr(checkin, 'check_in_account', fake_check_in_account)
+	monkeypatch.setattr(checkin, '_set_account_step', lambda step, message: step_updates.append((step, message)))
+
+	await checkin.check_in_account_with_retries(FakeAccount(), 0, object(), max_retries=1)
+
+	assert step_updates == [(0, '准备重试')]
+
+
+@pytest.mark.asyncio
 async def test_check_in_account_with_retries_stops_after_initial_attempt_and_max_retries(monkeypatch):
 	attempts = []
 

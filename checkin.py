@@ -138,8 +138,13 @@ class _AccountProgressDisplay:
 		try:
 			self.progress.start()
 		except BaseException:
-			sys.stdout = self._original_stdout
-			self._original_stdout = None
+			try:
+				self.progress.stop()
+			except BaseException:
+				pass
+			finally:
+				sys.stdout = self._original_stdout
+				self._original_stdout = None
 			raise
 
 	def stop(self) -> None:

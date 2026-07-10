@@ -86,23 +86,35 @@ def test_progress_display_preserves_stderr_identity(monkeypatch):
 	assert sys.stderr is stderr
 
 
-def test_progress_display_restores_stdout_when_start_raises_base_exception(monkeypatch):
+def test_progress_display_cleans_up_live_and_stdout_when_initial_refresh_is_interrupted(monkeypatch):
 	stream = TtyBuffer()
 	console = Console(file=stream, force_terminal=True, color_system=None, width=120)
 	log = checkin._AccountLog('main', 'main │ ', emit_lines=False)
 	display = checkin._AccountProgressDisplay([log], console=console, auto_refresh=False)
-	original_stdout = sys.stdout
+	previous_stdout = TtyBuffer()
+	monkeypatch.setattr(sys, 'stdout', previous_stdout)
+	original_refresh = display.progress.live.refresh
+	original_stop = display.progress.stop
 
-	def raise_keyboard_interrupt():
+	def interrupt_initial_refresh():
+		assert display.progress.live.is_started
+		monkeypatch.setattr(display.progress.live, 'refresh', original_refresh)
 		raise KeyboardInterrupt
 
-	monkeypatch.setattr(display.progress, 'start', raise_keyboard_interrupt)
+	def stop_then_raise():
+		original_stop()
+		raise RuntimeError('cleanup failed after stopping Live')
+
+	monkeypatch.setattr(display.progress.live, 'refresh', interrupt_initial_refresh)
+	monkeypatch.setattr(display.progress, 'stop', stop_then_raise)
 	try:
 		with pytest.raises(KeyboardInterrupt):
 			display.start()
-		assert sys.stdout is original_stdout
+		assert display.progress.live.is_started is False
+		assert sys.stdout is previous_stdout
 	finally:
-		sys.stdout = original_stdout
+		if display.progress.live.is_started:
+			original_stop()
 
 
 def test_format_progress_result_omits_missing_balance_and_reward():

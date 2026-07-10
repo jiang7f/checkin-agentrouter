@@ -40,6 +40,65 @@ def test_delete_last_session_removes_only_named_account(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_email_password_checkin_emits_semantic_steps(monkeypatch):
+	account = AccountConfig(
+		name='email-account',
+		provider='agentrouter',
+		cookies=None,
+		email='user@example.com',
+		password='secret',
+	)
+	provider = ProviderConfig(name='agentrouter', domain='https://agentrouter.org', sign_in_path='/api/checkin')
+	app_config = AppConfig(providers={'agentrouter': provider})
+	steps = []
+
+	async def fake_login_with_credentials(account_name, provider_config, provider_name, email, password):
+		return checkin.BrowserLoginResult(cookies={'session': 'email-session'}, api_user='email-user')
+
+	monkeypatch.setattr(checkin, 'login_with_credentials', fake_login_with_credentials)
+	monkeypatch.setattr(checkin, 'run_check_in_requests', lambda *args, **kwargs: (True, None, None))
+	monkeypatch.setattr(checkin, '_set_account_step', lambda step, message: steps.append((step, message)))
+
+	result = await checkin.check_in_account(account, 0, app_config)
+
+	assert result == (True, None, None)
+	assert steps == [
+		(1, '准备账号'),
+		(2, '邮箱密码登录'),
+		(3, '执行签到'),
+	]
+
+
+@pytest.mark.asyncio
+async def test_cookie_checkin_emits_semantic_steps(monkeypatch):
+	account = AccountConfig(
+		name='cookie-account',
+		provider='agentrouter',
+		cookies={'session': 'cookie-session'},
+		api_user='cookie-user',
+	)
+	provider = ProviderConfig(name='agentrouter', domain='https://agentrouter.org', sign_in_path='/api/checkin')
+	app_config = AppConfig(providers={'agentrouter': provider})
+	steps = []
+
+	async def fake_prepare_cookies(account_name, provider_config, user_cookies):
+		return user_cookies
+
+	monkeypatch.setattr(checkin, 'prepare_cookies', fake_prepare_cookies)
+	monkeypatch.setattr(checkin, 'run_check_in_requests', lambda *args, **kwargs: (True, None, None))
+	monkeypatch.setattr(checkin, '_set_account_step', lambda step, message: steps.append((step, message)))
+
+	result = await checkin.check_in_account(account, 0, app_config)
+
+	assert result == (True, None, None)
+	assert steps == [
+		(1, '读取登录态'),
+		(2, '准备请求凭证'),
+		(3, '执行签到'),
+	]
+
+
+@pytest.mark.asyncio
 async def test_github_browser_checkin_uses_previous_session_for_before_balance(monkeypatch):
 	account = AccountConfig(
 		name='profile_main',
