@@ -53,6 +53,7 @@ async def test_github_browser_checkin_uses_previous_session_for_before_balance(m
 	app_config = AppConfig(providers={'agentrouter': provider})
 	calls = []
 	saved = {}
+	steps = []
 
 	async def fake_login_with_github_browser(account_arg, account_name, provider_config, provider_name):
 		return checkin.BrowserLoginResult(cookies={'session': 'new-session', 'other': 'value'}, api_user='new-user')
@@ -70,6 +71,7 @@ async def test_github_browser_checkin_uses_previous_session_for_before_balance(m
 	)
 	monkeypatch.setattr(checkin, 'login_with_github_browser', fake_login_with_github_browser)
 	monkeypatch.setattr(checkin, 'run_user_info_request', fake_run_user_info_request)
+	monkeypatch.setattr(checkin, '_set_account_step', lambda step, message: steps.append((step, message)))
 	monkeypatch.setattr(
 		checkin,
 		'save_last_session',
@@ -83,6 +85,12 @@ async def test_github_browser_checkin_uses_previous_session_for_before_balance(m
 	assert result[0] is True
 	assert result[1] == {'success': True, 'quota': 100.0, 'used_quota': 50.0}
 	assert result[2] == {'success': True, 'quota': 125.0, 'used_quota': 50.0}
+	assert steps == [
+		(1, '查询签到前余额'),
+		(2, 'GitHub OAuth 登录'),
+		(3, '查询签到后余额'),
+		(4, '保存状态'),
+	]
 	assert calls == [({'session': 'old-session'}, 'old-user'), ({'session': 'new-session', 'other': 'value'}, 'new-user')]
 	assert saved == {'account_name': 'profile_main', 'cookies': {'session': 'new-session', 'other': 'value'}, 'api_user': 'new-user'}
 

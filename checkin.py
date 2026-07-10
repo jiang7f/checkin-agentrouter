@@ -1214,6 +1214,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	auth_method = None
 	user_info_before = None
 	if account.uses_github_browser():
+		_set_account_step(1, '查询签到前余额')
 		previous_session = load_last_session(account_name)
 		if previous_session:
 			print(f'[INFO] {account_name}: Reading balance with previous AgentRouter session')
@@ -1239,11 +1240,13 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		else:
 			print(f'[INFO] {account_name}: No previous AgentRouter session; first run will not show check-in increment')
 
+		_set_account_step(2, 'GitHub OAuth 登录')
 		login_result = await login_with_github_browser(account, account_name, provider_config, account.provider)
 		if login_result:
 			all_cookies = login_result.cookies
 			resolved_api_user = login_result.api_user
 			auth_method = 'github browser'
+			_set_account_step(3, '查询签到后余额')
 			user_info_after = await asyncio.to_thread(
 				run_user_info_request,
 				all_cookies,
@@ -1256,6 +1259,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			if user_info_after and user_info_after.get('success'):
 				print(user_info_after.get('display', f':money: Current balance: ${user_info_after["quota"]}'))
 				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by GitHub OAuth login)')
+				_set_account_step(4, '保存状态')
 				save_last_session(account_name, all_cookies, resolved_api_user)
 				return True, user_info_before, user_info_after
 			error = user_info_after.get('error', 'Unknown error') if user_info_after else 'Unknown error'
@@ -1265,8 +1269,10 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			print(f'[FAILED] {account_name}: GitHub browser login failed, will not use stale session cookies')
 			return False, None, None
 	elif account.has_login_credentials():
+		_set_account_step(1, '准备账号')
 		print(f'[INFO] {account_name}: Attempting email/password login (priority)...')
 		assert account.email is not None and account.password is not None
+		_set_account_step(2, '邮箱密码登录')
 		login_result = await login_with_credentials(
 			account_name,
 			provider_config,
@@ -1282,10 +1288,12 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			print(f'[FAILED] {account_name}: Email/password login failed, will not use stale session cookies')
 			return False, None, None
 	else:
+		_set_account_step(1, '读取登录态')
 		user_cookies = parse_cookies(account.cookies)
 		if not user_cookies:
 			print(f'[FAILED] {account_name}: Invalid configuration format')
 			return False, None, None
+		_set_account_step(2, '准备请求凭证')
 		all_cookies = await prepare_cookies(account_name, provider_config, user_cookies)
 		auth_method = 'session cookies'
 
@@ -1293,6 +1301,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 		return False, None, None
 
 	print(f'[AUTH] {account_name}: Using auth method -> {auth_method}')
+	_set_account_step(3, '执行签到')
 
 	return await asyncio.to_thread(
 		run_check_in_requests,
@@ -1318,7 +1327,9 @@ async def check_in_account_with_retries(
 	max_attempts = max_retries + 1
 
 	for attempt in range(1, max_attempts + 1):
+		_set_account_attempt(attempt, max_attempts)
 		if attempt > 1:
+			_set_account_step(0, '准备重试')
 			print(f'[RETRY] {account_name}: retrying check-in ({attempt - 1}/{max_retries})')
 
 		last_result = await check_in_account(account, account_index, app_config)
