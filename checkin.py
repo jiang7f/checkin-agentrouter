@@ -55,6 +55,7 @@ from utils.profiles import (
 from utils.proxy import get_playwright_proxy, get_proxy_server
 
 BALANCE_HASH_FILE = 'balance_hash.txt'
+LAST_SESSIONS_FILE = 'last_sessions.json'
 DEFAULT_PROFILE_PROVIDER = 'agentrouter'
 CLI_COMMAND = 'checkin-agentrouter'
 GITHUB_LOGIN_URL = 'https://github.com/login'
@@ -91,12 +92,81 @@ def generate_balance_hash(balances):
 	return hashlib.sha256(balance_json.encode('utf-8')).hexdigest()[:16]
 
 
+def _total_user_info(user_info: dict | None) -> float | None:
+	if not user_info or not user_info.get('success'):
+		return None
+	try:
+		return float(user_info['quota']) + float(user_info['used_quota'])
+	except (KeyError, TypeError, ValueError):
+		return None
+
+
+def calculate_check_in_reward(user_info_before: dict | None, user_info_after: dict | None) -> float | None:
+	before_total = _total_user_info(user_info_before)
+	after_total = _total_user_info(user_info_after)
+	if before_total is None or after_total is None:
+		return None
+	return round(max(after_total - before_total, 0), 2)
+
+
 def get_profile_root() -> Path:
 	return Path(os.getenv('CHECKIN_BROWSER_PROFILE_DIR', '.browser_profiles'))
 
 
 def get_env_file_path() -> Path:
 	return Path(os.getenv('CHECKIN_ENV_FILE', '.env'))
+
+
+def get_last_sessions_file_path() -> Path:
+	return Path(os.getenv('CHECKIN_LAST_SESSIONS_FILE', LAST_SESSIONS_FILE))
+
+
+def load_last_sessions() -> dict:
+	session_file = get_last_sessions_file_path()
+	if not session_file.exists():
+		return {}
+	try:
+		data = json.loads(session_file.read_text(encoding='utf-8'))
+	except Exception:  # nosec B110
+		return {}
+	return data if isinstance(data, dict) else {}
+
+
+def save_last_sessions(sessions: dict) -> None:
+	session_file = get_last_sessions_file_path()
+	session_file.parent.mkdir(parents=True, exist_ok=True)
+	session_file.write_text(
+		json.dumps(sessions, ensure_ascii=False, sort_keys=True, separators=(',', ':')) + '\n',
+		encoding='utf-8',
+	)
+
+
+def load_last_session(account_name: str) -> dict | None:
+	session = load_last_sessions().get(account_name)
+	if not isinstance(session, dict):
+		return None
+	cookies = session.get('cookies')
+	api_user = session.get('api_user')
+	if not isinstance(cookies, dict) or not cookies.get('session'):
+		return None
+	return {'cookies': cookies, 'api_user': api_user if isinstance(api_user, str) else None}
+
+
+def save_last_session(account_name: str, cookies: dict, api_user: str | None) -> None:
+	session_cookie = cookies.get('session') if isinstance(cookies, dict) else None
+	if not session_cookie:
+		return
+	sessions = load_last_sessions()
+	sessions[account_name] = {'cookies': {'session': session_cookie}, 'api_user': api_user}
+	save_last_sessions(sessions)
+
+
+def delete_last_session(account_name: str) -> None:
+	sessions = load_last_sessions()
+	if account_name not in sessions:
+		return
+	del sessions[account_name]
+	save_last_sessions(sessions)
 
 
 def load_agentrouter_profile_names_from_env_file() -> list[str]:
@@ -640,6 +710,7 @@ def run_profile_delete(provider_name: str, profile_name: str) -> int:
 	deleted = delete_profile(provider_name, profile_name, profile_root=get_profile_root())
 	if provider_name == DEFAULT_PROFILE_PROVIDER:
 		remove_agentrouter_profile_name_from_env_file(profile_name)
+		delete_last_session(profile_name)
 	if deleted:
 		print(f'Deleted browser profile "{profile_name}"')
 	else:
@@ -721,6 +792,60 @@ def get_user_info(client, headers, user_info_url: str):
 		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
 
 
+def make_request_headers(provider_config, account: AccountConfig, api_user_override: str | None = None) -> dict:
+	headers = {
+		'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+		'Accept': 'application/json, text/plain, */*',
+		'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+		'Accept-Encoding': 'gzip, deflate, br, zstd',
+		'Referer': provider_config.domain,
+		'Origin': provider_config.domain,
+		'Connection': 'keep-alive',
+		'Sec-Fetch-Dest': 'empty',
+		'Sec-Fetch-Mode': 'cors',
+		'Sec-Fetch-Site': 'same-origin',
+	}
+
+	api_user = api_user_override or account.api_user
+	if api_user:
+		headers[provider_config.api_user_key] = api_user
+	return headers
+
+
+def make_http_client_kwargs(account_name: str, *, use_proxy: bool) -> dict:
+	client_kwargs: dict = {'http2': True, 'timeout': 30.0}
+	proxy_url = get_proxy_server(use_proxy=use_proxy)
+	if proxy_url:
+		client_kwargs['proxy'] = proxy_url
+		if is_debug_enabled():
+			print(f'[INFO] {account_name}: HTTP client proxy enabled: {proxy_url}')
+		else:
+			print(f'[INFO] {account_name}: HTTP client proxy enabled')
+	elif use_proxy:
+		print(f'[WARN] {account_name}: Provider requires proxy but CHECKIN_PROXY_URL is not set')
+	return client_kwargs
+
+
+def run_user_info_request(
+	cookies: dict,
+	account: AccountConfig,
+	account_name: str,
+	provider_config,
+	*,
+	api_user_override: str | None = None,
+	use_proxy: bool = False,
+) -> dict | None:
+	"""用给定登录态读取用户信息。"""
+	try:
+		with httpx.Client(**make_http_client_kwargs(account_name, use_proxy=use_proxy)) as client:
+			client.cookies.update(cookies)
+			headers = make_request_headers(provider_config, account, api_user_override)
+			user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
+			return get_user_info(client, headers, user_info_url)
+	except Exception as e:
+		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
+
+
 async def prepare_cookies(account_name: str, provider_config, user_cookies: dict) -> dict | None:
 	"""准备请求所需的 cookies（可能包含 WAF cookies）"""
 	waf_cookies = {}
@@ -780,41 +905,6 @@ def execute_check_in(client, account_name: str, provider_config, headers: dict):
 		return False
 
 
-def format_check_in_notification(detail: dict) -> str:
-	"""格式化签到通知消息"""
-	lines = [
-		f'[CHECK-IN] {detail["name"]}',
-		'  ━━━━━━━━━━━━━━━━━━━━',
-		'  签到前',
-		f'     余额: ${detail["before_quota"]:.2f}  |  累计消耗: ${detail["before_used"]:.2f}',
-		'  签到后',
-		f'     余额: ${detail["after_quota"]:.2f}  |  累计消耗: ${detail["after_used"]:.2f}',
-	]
-
-	has_reward = detail['check_in_reward'] != 0
-	has_usage = detail['usage_increase'] != 0
-
-	if has_reward or has_usage:
-		lines.append('  ━━━━━━━━━━━━━━━━━━━━')
-
-		if not has_reward and has_usage:
-			lines.append('  今日已签到（期间有使用）')
-
-		if has_reward:
-			lines.append(f'  签到获得: +${detail["check_in_reward"]:.2f}')
-
-		if has_usage:
-			lines.append(f'  期间消耗: ${detail["usage_increase"]:.2f}')
-
-		if detail['balance_change'] != 0:
-			change_symbol = '+' if detail['balance_change'] > 0 else ''
-			lines.append(f'  余额变化: {change_symbol}${detail["balance_change"]:.2f}')
-	else:
-		lines.extend(['  ━━━━━━━━━━━━━━━━━━━━', '  今日已签到，无变化'])
-
-	return '\n'.join(lines)
-
-
 def format_daily_notification(
 	account_details: list[dict],
 	*,
@@ -834,11 +924,9 @@ def format_daily_notification(
 
 	def format_reward(reward) -> str:
 		if reward is None:
-			return '签到完成'
-		if abs(reward) < 0.005:
-			return '重复签到+0'
+			return ''
 		reward_text = f'{reward:.2f}'.rstrip('0').rstrip('.')
-		return f'签到+{reward_text}'
+		return f'本次签到+{reward_text}'
 
 	lines = [
 		'每日签到成功',
@@ -864,7 +952,8 @@ def format_daily_notification(
 		else:
 			quota_text = f'${quota:.2f}'
 		reward_text = format_reward(detail.get('check_in_reward'))
-		lines.append(f'{status} {name.ljust(max_name_length)}  {quota_text.ljust(max_balance_length)}  （{reward_text}）')
+		reward_suffix = f'  （{reward_text}）' if reward_text else ''
+		lines.append(f'{status} {name.ljust(max_name_length)}  {quota_text.ljust(max_balance_length)}{reward_suffix}')
 
 	lines.append('```')
 	return '\n'.join(lines)
@@ -888,6 +977,13 @@ def load_all_accounts() -> list[AccountConfig] | None:
 	return accounts
 
 
+def get_checkin_concurrency() -> int:
+	try:
+		return max(int(os.getenv('CHECKIN_CONCURRENCY', '3')), 1)
+	except ValueError:
+		return 3
+
+
 async def check_in_account(account: AccountConfig, account_index: int, app_config: AppConfig):
 	"""为单个账号执行签到操作"""
 	account_name = account.get_display_name(account_index)
@@ -904,12 +1000,54 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	all_cookies = None
 	resolved_api_user: str | None = None
 	auth_method = None
+	user_info_before = None
 	if account.uses_github_browser():
+		previous_session = load_last_session(account_name)
+		if previous_session:
+			print(f'[INFO] {account_name}: Reading balance with previous AgentRouter session')
+			# 旧会话只保存了 session cookie；provider 若需要 WAF cookie（如 agentrouter 的 acw_tc），
+			# 要先补齐再查，否则 before 查询会被 WAF 挡下，导致签到增量长期不显示。
+			before_cookies = await prepare_cookies(account_name, provider_config, previous_session['cookies'])
+			if before_cookies:
+				user_info_before = await asyncio.to_thread(
+					run_user_info_request,
+					before_cookies,
+					account,
+					account_name,
+					provider_config,
+					api_user_override=previous_session.get('api_user'),
+					use_proxy=provider_config.use_proxy,
+				)
+				if user_info_before and user_info_before.get('success'):
+					print(user_info_before.get('display', f':money: Current balance: ${user_info_before["quota"]}'))
+				elif user_info_before:
+					print(f'[WARN] {account_name}: Previous session balance query failed: {user_info_before.get("error", "Unknown error")}')
+			else:
+				print(f'[WARN] {account_name}: Unable to prepare WAF cookies for previous-session balance query; skipping increment')
+		else:
+			print(f'[INFO] {account_name}: No previous AgentRouter session; first run will not show check-in increment')
+
 		login_result = await login_with_github_browser(account, account_name, provider_config, account.provider)
 		if login_result:
 			all_cookies = login_result.cookies
 			resolved_api_user = login_result.api_user
 			auth_method = 'github browser'
+			user_info_after = await asyncio.to_thread(
+				run_user_info_request,
+				all_cookies,
+				account,
+				account_name,
+				provider_config,
+				api_user_override=resolved_api_user,
+				use_proxy=provider_config.use_proxy,
+			)
+			if user_info_after and user_info_after.get('success'):
+				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by GitHub OAuth login)')
+				save_last_session(account_name, all_cookies, resolved_api_user)
+				return True, user_info_before, user_info_after
+			error = user_info_after.get('error', 'Unknown error') if user_info_after else 'Unknown error'
+			print(f'[FAILED] {account_name}: Auto check-in failed - {error}')
+			return False, user_info_before, user_info_after
 		else:
 			print(f'[FAILED] {account_name}: GitHub browser login failed, will not use stale session cookies')
 			return False, None, None
@@ -943,7 +1081,8 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 
 	print(f'[AUTH] {account_name}: Using auth method -> {auth_method}')
 
-	return run_check_in_requests(
+	return await asyncio.to_thread(
+		run_check_in_requests,
 		all_cookies,
 		account,
 		account_name,
@@ -981,6 +1120,64 @@ async def check_in_account_with_retries(
 	return last_result
 
 
+async def process_account_for_main(
+	account: AccountConfig,
+	account_index: int,
+	app_config: AppConfig,
+) -> dict:
+	account_key = f'account_{account_index + 1}'
+	account_name = account.get_display_name(account_index)
+	account_detail = {'name': account_name, 'success': False, 'after_quota': None, 'check_in_reward': None}
+	current_balance = None
+	notification_content = None
+	need_notify = False
+
+	try:
+		success, user_info_before, user_info_after = await check_in_account_with_retries(account, account_index, app_config)
+		account_detail['success'] = success
+
+		if not success:
+			need_notify = True
+			if account.uses_github_browser():
+				profile_name = account.browser_profile or account_name
+				account_detail['failure_hint'] = f'可能需要重新登录: {CLI_COMMAND} add {profile_name}'
+			print(f'[NOTIFY] {account_name} failed, will send notification')
+
+		if user_info_after and user_info_after.get('success'):
+			current_quota = user_info_after['quota']
+			current_used = user_info_after['used_quota']
+			account_detail['after_quota'] = current_quota
+			current_balance = {'quota': current_quota, 'used': current_used}
+
+			# 仅当上一次会话余额（签到前）也拿到时，才计算并展示本次签到增量。
+			# 拿不到（首次运行、旧会话过期、WAF 拦截等）则保持 None，不显示括号提示。
+			if user_info_before and user_info_before.get('success'):
+				account_detail['check_in_reward'] = calculate_check_in_reward(user_info_before, user_info_after)
+
+		if need_notify:
+			status = '[SUCCESS]' if success else '[FAIL]'
+			account_result = f'{status} {account_name}'
+			if user_info_after and user_info_after.get('success'):
+				account_result += f'\n{user_info_after["display"]}'
+			elif user_info_after:
+				account_result += f'\n{user_info_after.get("error", "Unknown error")}'
+			notification_content = account_result
+
+	except Exception as e:
+		print(f'[FAILED] {account_name} processing exception: {e}')
+		need_notify = True
+		notification_content = f'[FAIL] {account_name} exception: {str(e)[:50]}...'
+
+	return {
+		'account_key': account_key,
+		'success': account_detail['success'],
+		'need_notify': need_notify,
+		'notification_content': notification_content,
+		'current_balance': current_balance,
+		'daily_detail': account_detail,
+	}
+
+
 def run_check_in_requests(
 	all_cookies: dict,
 	account: AccountConfig,
@@ -992,36 +1189,9 @@ def run_check_in_requests(
 ) -> tuple[bool, dict | None, dict | None]:
 	"""执行 HTTP 签到请求（同步，避免在 async 上下文中使用阻塞 httpx）。"""
 	try:
-		client_kwargs: dict = {'http2': True, 'timeout': 30.0}
-		proxy_url = get_proxy_server(use_proxy=use_proxy)
-		if proxy_url:
-			client_kwargs['proxy'] = proxy_url
-			if is_debug_enabled():
-				print(f'[INFO] {account_name}: HTTP client proxy enabled: {proxy_url}')
-			else:
-				print(f'[INFO] {account_name}: HTTP client proxy enabled')
-		elif use_proxy:
-			print(f'[WARN] {account_name}: Provider requires proxy but CHECKIN_PROXY_URL is not set')
-
-		with httpx.Client(**client_kwargs) as client:
+		with httpx.Client(**make_http_client_kwargs(account_name, use_proxy=use_proxy)) as client:
 			client.cookies.update(all_cookies)
-
-			headers = {
-				'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-				'Accept': 'application/json, text/plain, */*',
-				'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-				'Accept-Encoding': 'gzip, deflate, br, zstd',
-				'Referer': provider_config.domain,
-				'Origin': provider_config.domain,
-				'Connection': 'keep-alive',
-				'Sec-Fetch-Dest': 'empty',
-				'Sec-Fetch-Mode': 'cors',
-				'Sec-Fetch-Site': 'same-origin',
-			}
-
-			api_user = api_user_override or account.api_user
-			if api_user:
-				headers[provider_config.api_user_key] = api_user
+			headers = make_request_headers(provider_config, account, api_user_override)
 
 			user_info_url = f'{provider_config.domain}{provider_config.user_info_path}'
 			user_info_before = get_user_info(client, headers, user_info_url)
@@ -1084,78 +1254,29 @@ async def main():
 	total_count = len(accounts)
 	notification_content = []
 	current_balances = {}
-	account_check_in_details = {}
 	daily_notification_details = []
 	need_notify = False
 	balance_changed = False
+	concurrency = get_checkin_concurrency()
+	print(f'[INFO] Account concurrency: {concurrency}')
+	semaphore = asyncio.Semaphore(concurrency)
 
-	for i, account in enumerate(accounts):
-		account_key = f'account_{i + 1}'
-		account_name = account.get_display_name(i)
-		account_detail = {'name': account_name, 'success': False, 'after_quota': None, 'check_in_reward': None}
-		try:
-			success, user_info_before, user_info_after = await check_in_account_with_retries(account, i, app_config)
-			account_detail['success'] = success
-			if success:
-				success_count += 1
+	async def run_limited(index: int, account: AccountConfig) -> dict:
+		async with semaphore:
+			return await process_account_for_main(account, index, app_config)
 
-			should_notify_this_account = False
+	account_results = await asyncio.gather(*(run_limited(i, account) for i, account in enumerate(accounts)))
 
-			if not success:
-				should_notify_this_account = True
-				need_notify = True
-				if account.uses_github_browser():
-					profile_name = account.browser_profile or account_name
-					account_detail['failure_hint'] = f'可能需要重新登录: {CLI_COMMAND} add {profile_name}'
-				print(f'[NOTIFY] {account_name} failed, will send notification')
-
-			if user_info_after and user_info_after.get('success'):
-				current_quota = user_info_after['quota']
-				current_used = user_info_after['used_quota']
-				account_detail['after_quota'] = current_quota
-				current_balances[account_key] = {'quota': current_quota, 'used': current_used}
-
-				if user_info_before and user_info_before.get('success'):
-					before_quota = user_info_before['quota']
-					before_used = user_info_before['used_quota']
-					after_quota = user_info_after['quota']
-					after_used = user_info_after['used_quota']
-
-					total_before = before_quota + before_used
-					total_after = after_quota + after_used
-
-					check_in_reward = total_after - total_before
-					usage_increase = after_used - before_used
-					balance_change = after_quota - before_quota
-					account_detail['check_in_reward'] = check_in_reward
-
-					account_check_in_details[account_key] = {
-						'name': account.get_display_name(i),
-						'before_quota': before_quota,
-						'before_used': before_used,
-						'after_quota': after_quota,
-						'after_used': after_used,
-						'check_in_reward': check_in_reward,
-						'usage_increase': usage_increase,
-						'balance_change': balance_change,
-						'success': success,
-					}
-
-			if should_notify_this_account:
-				status = '[SUCCESS]' if success else '[FAIL]'
-				account_result = f'{status} {account_name}'
-				if user_info_after and user_info_after.get('success'):
-					account_result += f'\n{user_info_after["display"]}'
-				elif user_info_after:
-					account_result += f'\n{user_info_after.get("error", "Unknown error")}'
-				notification_content.append(account_result)
-
-		except Exception as e:
-			print(f'[FAILED] {account_name} processing exception: {e}')
+	for result in account_results:
+		if result['success']:
+			success_count += 1
+		if result['need_notify']:
 			need_notify = True
-			notification_content.append(f'[FAIL] {account_name} exception: {str(e)[:50]}...')
-		finally:
-			daily_notification_details.append(account_detail)
+		if result['notification_content']:
+			notification_content.append(result['notification_content'])
+		if result['current_balance']:
+			current_balances[result['account_key']] = result['current_balance']
+		daily_notification_details.append(result['daily_detail'])
 
 	current_balance_hash = generate_balance_hash(current_balances) if current_balances else None
 	if current_balance_hash:

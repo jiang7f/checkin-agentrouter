@@ -131,19 +131,26 @@ AgentRouter Check-in
 余额：
 
 ```text
-✅ main    $31.80  （签到+25）
-✅ backup  $50.20  （重复签到+0）
+✅ main    $31.80  （本次签到+25）
+✅ backup  $50.20
 ❌ spare   获取失败  （可能需要重新登录: checkin-agentrouter add spare）
 ```
 
-`签到+25` 和 `重复签到+0` 的判断来自签到前后余额数据：
+`本次签到+xx` 的判断来自上一次保存的 AgentRouter 登录态：
 
-- 如果签到前后 `quota + used_quota` 增加了 25，就显示 `签到+25`
-- 如果签到成功但 `quota + used_quota` 没有增加，就显示 `重复签到+0`
-- 如果读取不到签到前后的差值，就显示 `签到完成`
-- 正常增加 25 的签到不会显示 `重复签到+0`
+- 每次成功后只保存上一次 AgentRouter 的 `session` 和 `api_user`
+- 下次运行先用旧登录态查签到前余额
+- 再用 GitHub profile 重新 OAuth 登录 AgentRouter 触发签到
+- 最后查签到后余额，两者差值显示为 `本次签到+xx`
+- 首次运行没有旧登录态，只显示当前余额，不显示增量
 
 这个行为有回归测试覆盖。
+
+账号会并发执行，默认并发数是 3。可以用下面的环境变量调整：
+
+```bash
+CHECKIN_CONCURRENCY=3
+```
 
 ## 本地定时任务
 
@@ -198,6 +205,7 @@ uv run pytest tests/test_checkin_notification.py tests/test_profile_commands.py 
 - `.browser_profiles/`
 - `.venv/`
 - `balance_hash.txt`
+- `last_sessions.json`
 - `checkin_screenshots/`
 - coverage 和缓存目录
 

@@ -30,23 +30,27 @@ async def test_check_in_account_uses_github_browser_before_cookie_auth(monkeypat
 		calls['github_browser'] = (account_arg, account_name, provider_config.name, provider_name)
 		return checkin.BrowserLoginResult(cookies={'session': 'new-session'}, api_user='new-api-user')
 
-	def fake_run_check_in_requests(all_cookies, account_arg, account_name, provider_config, **kwargs):
+	def fake_run_user_info_request(cookies, account_arg, account_name, provider_config, **kwargs):
 		calls['check_in'] = {
-			'cookies': all_cookies,
+			'cookies': cookies,
 			'account': account_arg,
 			'account_name': account_name,
 			'provider': provider_config.name,
 			'api_user_override': kwargs.get('api_user_override'),
 			'use_proxy': kwargs.get('use_proxy'),
 		}
-		return True, {'success': True, 'quota': 10, 'used_quota': 0}, {'success': True, 'quota': 35, 'used_quota': 0}
+		return {'success': True, 'quota': 35, 'used_quota': 0}
 
 	monkeypatch.setattr(checkin, 'login_with_github_browser', fake_login_with_github_browser)
-	monkeypatch.setattr(checkin, 'run_check_in_requests', fake_run_check_in_requests)
+	monkeypatch.setattr(checkin, 'run_user_info_request', fake_run_user_info_request)
+	monkeypatch.setattr(checkin, 'load_last_session', lambda account_name: None)
+	monkeypatch.setattr(checkin, 'save_last_session', lambda account_name, cookies, api_user: None)
 
 	result = await checkin.check_in_account(account, 0, app_config)
 
 	assert result[0] is True
+	assert result[1] is None
+	assert result[2] == {'success': True, 'quota': 35, 'used_quota': 0}
 	assert calls['github_browser'] == (account, 'github-account', 'agentrouter', 'agentrouter')
 	assert calls['check_in']['cookies'] == {'session': 'new-session'}
 	assert calls['check_in']['api_user_override'] == 'new-api-user'

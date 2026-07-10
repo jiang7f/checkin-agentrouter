@@ -30,10 +30,10 @@ def test_format_daily_notification_shows_check_in_rewards_without_usage():
 	assert '余额：' in content
 	assert line_containing(content, 'profile_main').startswith('✅ profile_main')
 	assert '$6.80' in line_containing(content, 'profile_main')
-	assert '（重复签到+0）' in line_containing(content, 'profile_main')
+	assert '（本次签到+0）' in line_containing(content, 'profile_main')
 	assert line_containing(content, 'profile_backup').startswith('✅ profile_backup')
 	assert '$25.20' in line_containing(content, 'profile_backup')
-	assert '（签到+25）' in line_containing(content, 'profile_backup')
+	assert '（本次签到+25）' in line_containing(content, 'profile_backup')
 	assert line_containing(content, 'zx').startswith('❌ zx')
 	assert '获取失败' in line_containing(content, 'zx')
 	assert 'checkin-agentrouter add zx' in line_containing(content, 'zx')
@@ -57,7 +57,7 @@ def test_format_daily_notification_marks_success_even_when_balance_missing():
 	assert '结果: 1/1' in content
 	assert line_containing(content, 'profile_backup').startswith('✅ profile_backup')
 	assert '余额获取失败' in line_containing(content, 'profile_backup')
-	assert '（签到完成）' in line_containing(content, 'profile_backup')
+	assert '（' not in line_containing(content, 'profile_backup')
 
 
 def test_format_daily_notification_does_not_label_reward_as_duplicate():
@@ -71,8 +71,24 @@ def test_format_daily_notification_does_not_label_reward_as_duplicate():
 	)
 
 	normal_line = line_containing(content, 'normal')
-	assert '（签到+25）' in normal_line
+	assert '（本次签到+25）' in normal_line
 	assert '重复签到+0' not in normal_line
+
+
+def test_format_daily_notification_omits_reward_when_no_previous_session():
+	content = checkin.format_daily_notification(
+		[
+			{'name': 'first', 'success': True, 'after_quota': 31.8, 'check_in_reward': None},
+		],
+		success_count=1,
+		total_count=1,
+		execution_time='2026-07-08 16:25:11',
+	)
+
+	first_line = line_containing(content, 'first')
+	assert first_line.startswith('✅ first')
+	assert '$31.80' in first_line
+	assert '（' not in first_line
 
 
 def test_should_send_notification_when_always_notify_enabled(monkeypatch):

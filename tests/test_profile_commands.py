@@ -57,6 +57,11 @@ def test_profile_delete_command_removes_saved_profile(monkeypatch, tmp_path, cap
 	env_file = tmp_path / '.env'
 	env_file.write_text('AGENTROUTER_ACCOUNTS=["profile_main","profile_backup"]\n')
 	monkeypatch.setenv('CHECKIN_ENV_FILE', str(env_file))
+	session_file = tmp_path / 'last_sessions.json'
+	session_file.write_text(
+		'{"profile_main":{"cookies":{"session":"main"},"api_user":"1"},"profile_backup":{"cookies":{"session":"backup"},"api_user":"2"}}'
+	)
+	monkeypatch.setenv('CHECKIN_LAST_SESSIONS_FILE', str(session_file))
 	profile_dir = get_profile_dir('agentrouter', 'profile_main', profile_root=tmp_path)
 	profile_dir.mkdir(parents=True)
 
@@ -67,6 +72,7 @@ def test_profile_delete_command_removes_saved_profile(monkeypatch, tmp_path, cap
 	assert 'Deleted browser profile "profile_main"' in output
 	assert not profile_dir.exists()
 	assert 'AGENTROUTER_ACCOUNTS=["profile_backup"]' in env_file.read_text()
+	assert checkin.load_last_sessions() == {'profile_backup': {'cookies': {'session': 'backup'}, 'api_user': '2'}}
 
 
 @pytest.mark.asyncio
@@ -206,15 +212,19 @@ async def test_check_in_account_passes_browser_profile_to_github_login(monkeypat
 		calls['login'] = (account_arg.browser_profile, account_name, provider_config.name, provider_name)
 		return checkin.BrowserLoginResult(cookies={'session': 'new-session'}, api_user='123456')
 
-	def fake_run_check_in_requests(all_cookies, account_arg, account_name, provider_config, **kwargs):
+	def fake_run_user_info_request(cookies, account_arg, account_name, provider_config, **kwargs):
 		calls['check_in'] = kwargs
-		return True, {'success': True, 'quota': 10, 'used_quota': 0}, {'success': True, 'quota': 35, 'used_quota': 0}
+		return {'success': True, 'quota': 35, 'used_quota': 0}
 
 	monkeypatch.setattr(checkin, 'login_with_github_browser', fake_login_with_github_browser)
-	monkeypatch.setattr(checkin, 'run_check_in_requests', fake_run_check_in_requests)
+	monkeypatch.setattr(checkin, 'run_user_info_request', fake_run_user_info_request)
+	monkeypatch.setattr(checkin, 'load_last_session', lambda account_name: None)
+	monkeypatch.setattr(checkin, 'save_last_session', lambda account_name, cookies, api_user: None)
 
 	result = await checkin.check_in_account(account, 0, app_config)
 
 	assert result[0] is True
+	assert result[1] is None
+	assert result[2] == {'success': True, 'quota': 35, 'used_quota': 0}
 	assert calls['login'] == ('profile_main', 'github-account', 'agentrouter', 'agentrouter')
 	assert calls['check_in']['api_user_override'] == '123456'
