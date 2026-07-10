@@ -15,6 +15,10 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
 
+from rich.console import Console
+from rich.markup import escape
+from rich.progress import BarColumn, Progress, TaskID, TextColumn, TimeElapsedColumn
+
 if hasattr(sys.stdout, 'reconfigure'):
 	sys.stdout.reconfigure(line_buffering=True)
 if hasattr(sys.stderr, 'reconfigure'):
@@ -33,14 +37,36 @@ _PREFIX_COLORS = (36, 32, 33, 35, 34, 31)  # cyan / green / yellow / magenta / b
 class _AccountLog:
 	"""记录单个账号的行前缀、未换行的残余内容，以及最近一条日志（供心跳展示当前步骤）。"""
 
-	__slots__ = ('name', 'prefix', 'partial', 'last_line', 'start')
+	__slots__ = (
+		'name',
+		'prefix',
+		'partial',
+		'last_line',
+		'start',
+		'lines',
+		'emit_lines',
+		'task_id',
+		'step',
+		'message',
+		'attempt',
+		'max_attempts',
+		'display',
+	)
 
-	def __init__(self, name: str, prefix: str):
+	def __init__(self, name: str, prefix: str, *, emit_lines: bool = True):
 		self.name = name
 		self.prefix = prefix
 		self.partial = ''
 		self.last_line = ''
 		self.start = time.monotonic()
+		self.lines: list[str] = []
+		self.emit_lines = emit_lines
+		self.task_id: TaskID | None = None
+		self.step = 0
+		self.message = '等待'
+		self.attempt = 1
+		self.max_attempts = 1
+		self.display = None
 
 
 class _ContextStdout:
@@ -54,9 +80,11 @@ class _ContextStdout:
 		lines = []
 		while '\n' in log.partial:
 			line, log.partial = log.partial.split('\n', 1)
+			log.lines.append(line)
 			if line.strip():
 				log.last_line = line.strip()
-			lines.append(f'{log.prefix}{line}\n')
+			if log.emit_lines:
+				lines.append(f'{log.prefix}{line}\n')
 		if lines:
 			with _stdout_lock:
 				_real_stdout.write(''.join(lines))
@@ -74,6 +102,96 @@ class _ContextStdout:
 sys.stdout = _ContextStdout()
 
 
+class _AccountProgressDisplay:
+	def __init__(self, logs: list[_AccountLog], *, console: Console | None = None, auto_refresh: bool = True):
+		self.console = console or Console(file=_real_stdout)
+		self.progress = Progress(
+			TextColumn('{task.description}'),
+			BarColumn(bar_width=18),
+			TextColumn('step {task.completed:.0f}/{task.total:.0f}'),
+			TextColumn('{task.fields[attempt]}'),
+			TextColumn('{task.fields[message]}'),
+			TimeElapsedColumn(),
+			console=self.console,
+			auto_refresh=auto_refresh,
+			transient=False,
+		)
+		width = max((len(log.name) for log in logs), default=0)
+		for index, log in enumerate(logs):
+			color = ('cyan', 'green', 'yellow', 'magenta', 'blue', 'red')[index % 6]
+			log.task_id = self.progress.add_task(
+				f'[{color}]{escape(log.name.ljust(width))}[/{color}]',
+				total=4,
+				completed=0,
+				attempt='',
+				message='等待',
+			)
+			log.display = self
+
+	def start(self) -> None:
+		self.progress.start()
+
+	def stop(self) -> None:
+		self.progress.stop()
+
+	def refresh(self) -> None:
+		self.progress.refresh()
+
+	def update(self, log: _AccountLog, *, step: int, message: str, attempt: int, max_attempts: int) -> None:
+		if log.task_id is None:
+			raise RuntimeError(f'Progress task is not initialized for {log.name}')
+		log.step = step
+		log.message = message
+		log.attempt = attempt
+		log.max_attempts = max_attempts
+		self.progress.update(
+			log.task_id,
+			completed=step,
+			attempt=f'try {attempt}/{max_attempts}',
+			message=message,
+		)
+
+	def finish(self, log: _AccountLog, message: str) -> None:
+		self.update(log, step=4, message=message, attempt=log.attempt, max_attempts=log.max_attempts)
+
+	def fail(self, log: _AccountLog) -> None:
+		self.update(log, step=log.step, message='[red]失败[/red]', attempt=log.attempt, max_attempts=log.max_attempts)
+
+
+def _set_account_step(step: int, message: str) -> None:
+	log = _current_log.get()
+	if log is None:
+		return
+	log.step = step
+	log.message = message
+	if log.display is not None:
+		log.display.update(log, step=step, message=message, attempt=log.attempt, max_attempts=log.max_attempts)
+
+
+def _set_account_attempt(attempt: int, max_attempts: int) -> None:
+	log = _current_log.get()
+	if log is None:
+		return
+	log.attempt = attempt
+	log.max_attempts = max_attempts
+	if log.display is not None:
+		log.display.update(log, step=log.step, message=log.message, attempt=attempt, max_attempts=max_attempts)
+
+
+def _format_progress_result(result: dict) -> str:
+	if not result['success']:
+		return '失败'
+	detail = result['daily_detail']
+	parts = ['完成']
+	quota = detail.get('after_quota')
+	reward = detail.get('check_in_reward')
+	if quota is not None:
+		parts.append(f'${quota:.2f}')
+	if reward is not None:
+		parts.append(f'(+{reward:g})')
+	return ' '.join(parts)
+
+
 def _make_line_prefix(name: str, width: int, index: int) -> str:
 	"""生成账号行前缀；在真实终端下按账号上色，日志文件里则用纯文本。"""
 	sep = f'{name.ljust(width)} │ '
@@ -87,9 +205,11 @@ def _flush_log_partial(log: _AccountLog) -> None:
 	"""账号结束时，把没有换行结尾的残余内容补一个前缀后输出。"""
 	if not log.partial:
 		return
-	with _stdout_lock:
-		_real_stdout.write(f'{log.prefix}{log.partial}\n')
-		_real_stdout.flush()
+	log.lines.append(log.partial)
+	if log.emit_lines:
+		with _stdout_lock:
+			_real_stdout.write(f'{log.prefix}{log.partial}\n')
+			_real_stdout.flush()
 	log.partial = ''
 
 
