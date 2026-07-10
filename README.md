@@ -112,7 +112,15 @@ configured  .env 中配置了这个名字
 checkin-agentrouter
 ```
 
-脚本会按 `CHECKIN_CONCURRENCY` 设置并发处理账号，终端多账号运行时会显示实时进度。单个账号失败时最多重试 5 次。最终通知只显示最后结果，不显示中间重试过程。
+账号会并发执行，默认并发数是 3，可以通过环境变量调整：
+
+```bash
+CHECKIN_CONCURRENCY=3
+```
+
+手动在交互终端运行多个账号时，每个账号固定显示一行实时进度。成功账号保留最终余额，失败账号会在进度结束后展开详细日志。开启 `DEBUG_MODE` 时，成功账号的完整缓冲日志也会在进度结束后展开。
+
+`launchd`、重定向输出、单账号运行和并发数为 1 时继续输出普通逐行日志。单个账号失败时最多重试 5 次，最终通知只显示最后结果，不显示中间重试过程。
 
 ## 飞书通知
 
@@ -145,12 +153,6 @@ AgentRouter Check-in
 - 首次运行没有旧登录态，只显示当前余额，不显示增量
 
 这个行为有回归测试覆盖。
-
-账号会并发执行，默认并发数是 3。手动在终端运行多个账号时，每个账号固定显示一行实时进度。成功账号保留最终余额，失败账号会在进度结束后展开详细日志。开启 `DEBUG_MODE` 时，成功账号的完整缓冲日志也会在进度结束后展开。`launchd`、重定向输出、单账号运行和并发数为 1 时继续输出普通逐行日志。
-
-```bash
-CHECKIN_CONCURRENCY=3
-```
 
 ## 本地定时任务
 
@@ -192,8 +194,8 @@ uv run python -m cloakbrowser install
 ## 测试
 
 ```bash
-uv run ruff check checkin.py utils/browser.py utils/config.py utils/profiles.py tests/test_browser_settings.py tests/test_github_browser_login.py tests/test_profile_commands.py tests/test_provider_config.py tests/test_checkin_notification.py tests/test_checkin_retry.py tests/test_notify.py
-uv run pytest tests/test_checkin_notification.py tests/test_profile_commands.py -q
+uv run ruff check .
+uv run pytest -q
 ```
 
 ## 安全说明

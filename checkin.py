@@ -24,10 +24,9 @@ if hasattr(sys.stdout, 'reconfigure'):
 if hasattr(sys.stderr, 'reconfigure'):
 	sys.stderr.reconfigure(line_buffering=True)
 
-# 并发签到时，给每个账号的输出实时逐行加前缀（账号名），互不阻塞、谁先出谁先显示。
-# contextvars 会随 asyncio.to_thread 传入线程，因此浏览器/HTTP 线程里的 print 也会自动带上
-# 正确前缀，无需改动 utils/browser.py。此外用心跳定时汇报每个账号“卡在哪一步”，避免某步
-# 长时间阻塞（如浏览器登录）时看起来像卡死。
+# 并发签到按输出环境选择展示方式。交互终端使用 Rich 固定显示每个账号的进度，账号日志先缓冲。
+# 非交互日志实时输出账号前缀，并用心跳报告长时间运行的步骤。contextvars 会随 asyncio.to_thread
+# 进入浏览器和 HTTP 线程，因此 utils/browser.py 等模块里的 print 仍能归属到正确账号。
 _real_stdout = sys.stdout
 _stdout_lock = threading.Lock()
 _current_log: contextvars.ContextVar = contextvars.ContextVar('checkin_current_log', default=None)
@@ -35,7 +34,7 @@ _PREFIX_COLORS = (36, 32, 33, 35, 34, 31)  # cyan / green / yellow / magenta / b
 
 
 class _AccountLog:
-	"""记录单个账号的行前缀、未换行的残余内容，以及最近一条日志（供心跳展示当前步骤）。"""
+	"""保存单个账号的输出缓冲、进度状态和非 TTY 行前缀。"""
 
 	__slots__ = (
 		'name',
@@ -70,7 +69,7 @@ class _AccountLog:
 
 
 class _ContextStdout:
-	"""按当前 context 决定是否加账号前缀；只对完整行加前缀，行内的部分写入先攒着。"""
+	"""按当前账号 context 缓冲输出，或在非 TTY 模式下实时写出完整行。"""
 
 	def write(self, data):
 		log = _current_log.get()
@@ -103,6 +102,8 @@ sys.stdout = _ContextStdout()
 
 
 class _AccountProgressDisplay:
+	"""管理多账号 Rich 进度行，并协调进度运行期间的标准输出。"""
+
 	def __init__(self, logs: list[_AccountLog], *, console: Console | None = None, auto_refresh: bool = True):
 		self.console = console or Console(file=_real_stdout)
 		self.progress = Progress(
@@ -116,6 +117,7 @@ class _AccountProgressDisplay:
 			auto_refresh=auto_refresh,
 			transient=False,
 			redirect_stdout=False,
+			# CloakBrowser 等依赖会写 stderr，必须交给 Live 协调，否则终端会残留旧进度行。
 			redirect_stderr=True,
 		)
 		self._original_stdout = None
