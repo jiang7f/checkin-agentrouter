@@ -116,7 +116,7 @@ class _AccountProgressDisplay:
 			auto_refresh=auto_refresh,
 			transient=False,
 			redirect_stdout=False,
-			redirect_stderr=False,
+			redirect_stderr=True,
 		)
 		self._original_stdout = None
 		width = max((len(log.name) for log in logs), default=0)

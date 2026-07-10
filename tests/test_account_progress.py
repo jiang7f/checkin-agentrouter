@@ -69,7 +69,7 @@ def test_progress_display_renders_step_attempt_and_final_balance():
 	assert '完成 $31.80 (+25)' in output
 
 
-def test_progress_display_preserves_stderr_identity(monkeypatch):
+def test_progress_display_routes_stderr_through_live_and_restores_identity(monkeypatch):
 	stream = TtyBuffer()
 	stderr = TtyBuffer()
 	monkeypatch.setattr(sys, 'stderr', stderr)
@@ -79,7 +79,10 @@ def test_progress_display_preserves_stderr_identity(monkeypatch):
 
 	display.start()
 	try:
-		assert sys.stderr is stderr
+		assert sys.stderr is not stderr
+		sys.stderr.write('\n\n')
+		sys.stderr.flush()
+		assert stderr.getvalue() == ''
 	finally:
 		display.stop()
 
