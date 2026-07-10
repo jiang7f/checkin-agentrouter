@@ -116,6 +116,7 @@ class _AccountProgressDisplay:
 			auto_refresh=auto_refresh,
 			transient=False,
 			redirect_stdout=False,
+			redirect_stderr=False,
 		)
 		self._original_stdout = None
 		width = max((len(log.name) for log in logs), default=0)
@@ -171,6 +172,9 @@ class _AccountProgressDisplay:
 
 	def fail(self, log: _AccountLog) -> None:
 		self.update(log, step=log.step, message='[red]失败[/red]', attempt=log.attempt, max_attempts=log.max_attempts)
+
+	def interrupt(self, log: _AccountLog) -> None:
+		self.update(log, step=log.step, message='[yellow]中断[/yellow]', attempt=log.attempt, max_attempts=log.max_attempts)
 
 
 def _set_account_step(step: int, message: str) -> None:
@@ -262,6 +266,17 @@ def _print_buffered_account_logs(
 		heading = '调试详情' if result['success'] else '失败详情'
 		with _stdout_lock:
 			_real_stdout.write(f'\n[{log.name}] {heading}\n')
+			for line in log.lines:
+				_real_stdout.write(f'{log.prefix}{line}\n')
+			_real_stdout.flush()
+
+
+def _print_interrupted_account_logs(logs: list[_AccountLog]) -> None:
+	for log in logs:
+		if not log.lines:
+			continue
+		with _stdout_lock:
+			_real_stdout.write(f'\n[{log.name}] 中断详情\n')
 			for line in log.lines:
 				_real_stdout.write(f'{log.prefix}{line}\n')
 			_real_stdout.flush()
@@ -1555,16 +1570,36 @@ async def main():
 				_current_log.reset(token)
 
 	heartbeat_task = asyncio.create_task(_heartbeat(active_logs)) if parallel_output and not progress_output else None
-	if progress_display is not None:
-		progress_display.start()
 	try:
-		account_results = await asyncio.gather(*(run_limited(i, account) for i, account in enumerate(accounts)))
-	finally:
-		if heartbeat_task is not None:
-			heartbeat_task.cancel()
-			await asyncio.gather(heartbeat_task, return_exceptions=True)
+		account_tasks: list[asyncio.Task] = []
 		if progress_display is not None:
-			progress_display.stop()
+			progress_display.start()
+		try:
+			account_tasks = [
+				asyncio.create_task(run_limited(index, account)) for index, account in enumerate(accounts)
+			]
+			try:
+				account_results = await asyncio.gather(*account_tasks)
+			except BaseException:
+				for task in account_tasks:
+					if not task.done():
+						task.cancel()
+				await asyncio.gather(*account_tasks, return_exceptions=True)
+				if progress_display is not None:
+					for log, task in zip(account_logs, account_tasks, strict=True):
+						if task.cancelled() or task.exception() is not None:
+							progress_display.interrupt(log)
+				raise
+		finally:
+			if heartbeat_task is not None:
+				heartbeat_task.cancel()
+				await asyncio.gather(heartbeat_task, return_exceptions=True)
+			if progress_display is not None:
+				progress_display.stop()
+	except BaseException:
+		if progress_output:
+			_print_interrupted_account_logs(account_logs)
+		raise
 
 	if progress_output:
 		_print_buffered_account_logs(account_logs, account_results, include_success=is_debug_enabled())

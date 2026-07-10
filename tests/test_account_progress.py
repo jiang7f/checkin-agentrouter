@@ -1,4 +1,6 @@
+import asyncio
 import io
+import sys
 
 import pytest
 from rich.console import Console
@@ -65,6 +67,23 @@ def test_progress_display_renders_step_attempt_and_final_balance():
 	assert 'step 4/4' in output
 	assert 'try 2/6' in output
 	assert '完成 $31.80 (+25)' in output
+
+
+def test_progress_display_preserves_stderr_identity(monkeypatch):
+	stream = TtyBuffer()
+	stderr = TtyBuffer()
+	monkeypatch.setattr(sys, 'stderr', stderr)
+	console = Console(file=stream, force_terminal=True, color_system=None, width=120)
+	log = checkin._AccountLog('main', 'main │ ', emit_lines=False)
+	display = checkin._AccountProgressDisplay([log], console=console, auto_refresh=False)
+
+	display.start()
+	try:
+		assert sys.stderr is stderr
+	finally:
+		display.stop()
+
+	assert sys.stderr is stderr
 
 
 def test_format_progress_result_omits_missing_balance_and_reward():
@@ -189,3 +208,92 @@ async def test_tty_main_prints_failed_account_buffer_after_progress(monkeypatch)
 	assert '[FAILED] one: oauth timeout' in output
 	assert '[two] 失败详情' in output
 	assert '[FAILED] two: oauth timeout' in output
+	first_heading = output.index('[one] 失败详情')
+	assert output.rfind('step 0/4', 0, first_heading) != -1
+
+
+@pytest.mark.asyncio
+async def test_tty_main_cancellation_cancels_siblings_and_replays_started_logs(monkeypatch):
+	stream = TtyBuffer()
+	monkeypatch.setattr(checkin, '_real_stdout', stream)
+	accounts = [
+		AccountConfig(cookies={'session': 'one'}, api_user='1', provider='agentrouter', name='one'),
+		AccountConfig(cookies={'session': 'two'}, api_user='2', provider='agentrouter', name='two'),
+	]
+	_patch_main_dependencies(monkeypatch, accounts)
+	started = set()
+	cancelled = set()
+	both_started = asyncio.Event()
+
+	async def fake_process(account, index, app_config):
+		print(f'[INFO] {account.name} started')
+		started.add(account.name)
+		if len(started) == len(accounts):
+			both_started.set()
+		try:
+			await asyncio.Event().wait()
+		except asyncio.CancelledError:
+			cancelled.add(account.name)
+			print(f'[INFO] {account.name} cancelled')
+			raise
+
+	monkeypatch.setattr(checkin, 'process_account_for_main', fake_process)
+	main_task = asyncio.create_task(checkin.main())
+	await asyncio.wait_for(both_started.wait(), timeout=1)
+	main_task.cancel()
+	with pytest.raises(asyncio.CancelledError):
+		await main_task
+
+	assert cancelled == {'one', 'two'}
+	output = stream.getvalue()
+	for name in ('one', 'two'):
+		assert f'[{name}] 中断详情' in output
+		assert f'[INFO] {name} started' in output
+		assert f'[INFO] {name} cancelled' in output
+	first_heading = output.index('[one] 中断详情')
+	assert output.rfind('中断', 0, first_heading) != -1
+
+
+@pytest.mark.asyncio
+async def test_tty_main_exception_cancels_sibling_and_replays_started_logs(monkeypatch):
+	stream = TtyBuffer()
+	monkeypatch.setattr(checkin, '_real_stdout', stream)
+	accounts = [
+		AccountConfig(cookies={'session': 'one'}, api_user='1', provider='agentrouter', name='one'),
+		AccountConfig(cookies={'session': 'two'}, api_user='2', provider='agentrouter', name='two'),
+	]
+	_patch_main_dependencies(monkeypatch, accounts)
+	started = set()
+	cancelled = set()
+	both_started = asyncio.Event()
+
+	async def fake_process(account, index, app_config):
+		print(f'[INFO] {account.name} started')
+		started.add(account.name)
+		if len(started) == len(accounts):
+			both_started.set()
+		await both_started.wait()
+		if account.name == 'one':
+			print('[FAILED] one crashed')
+			raise RuntimeError('unexpected account error')
+		try:
+			await asyncio.Event().wait()
+		except asyncio.CancelledError:
+			cancelled.add(account.name)
+			print(f'[INFO] {account.name} cancelled')
+			raise
+
+	monkeypatch.setattr(checkin, 'process_account_for_main', fake_process)
+	with pytest.raises(RuntimeError, match='unexpected account error'):
+		await checkin.main()
+
+	assert cancelled == {'two'}
+	output = stream.getvalue()
+	assert '[one] 中断详情' in output
+	assert '[INFO] one started' in output
+	assert '[FAILED] one crashed' in output
+	assert '[two] 中断详情' in output
+	assert '[INFO] two started' in output
+	assert '[INFO] two cancelled' in output
+	first_heading = output.index('[one] 中断详情')
+	assert output.rfind('中断', 0, first_heading) != -1
