@@ -137,7 +137,7 @@ class _AccountProgressDisplay:
 			sys.stdout = _ContextStdout()
 		try:
 			self.progress.start()
-		except Exception:
+		except BaseException:
 			sys.stdout = self._original_stdout
 			self._original_stdout = None
 			raise
@@ -271,12 +271,24 @@ def _print_buffered_account_logs(
 			_real_stdout.flush()
 
 
-def _print_interrupted_account_logs(logs: list[_AccountLog]) -> None:
-	for log in logs:
+def _print_exceptional_account_logs(
+	logs: list[_AccountLog],
+	tasks: list[asyncio.Task],
+	*,
+	include_success: bool,
+) -> None:
+	for log, task in zip(logs, tasks, strict=True):
 		if not log.lines:
 			continue
+		if task.cancelled() or task.exception() is not None:
+			heading = '中断详情'
+		else:
+			result = task.result()
+			if result['success'] and not include_success:
+				continue
+			heading = '调试详情' if result['success'] else '失败详情'
 		with _stdout_lock:
-			_real_stdout.write(f'\n[{log.name}] 中断详情\n')
+			_real_stdout.write(f'\n[{log.name}] {heading}\n')
 			for line in log.lines:
 				_real_stdout.write(f'{log.prefix}{line}\n')
 			_real_stdout.flush()
@@ -1597,8 +1609,12 @@ async def main():
 			if progress_display is not None:
 				progress_display.stop()
 	except BaseException:
-		if progress_output:
-			_print_interrupted_account_logs(account_logs)
+		if progress_output and account_tasks:
+			_print_exceptional_account_logs(
+				account_logs,
+				account_tasks,
+				include_success=is_debug_enabled(),
+			)
 		raise
 
 	if progress_output:

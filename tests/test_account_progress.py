@@ -86,6 +86,25 @@ def test_progress_display_preserves_stderr_identity(monkeypatch):
 	assert sys.stderr is stderr
 
 
+def test_progress_display_restores_stdout_when_start_raises_base_exception(monkeypatch):
+	stream = TtyBuffer()
+	console = Console(file=stream, force_terminal=True, color_system=None, width=120)
+	log = checkin._AccountLog('main', 'main │ ', emit_lines=False)
+	display = checkin._AccountProgressDisplay([log], console=console, auto_refresh=False)
+	original_stdout = sys.stdout
+
+	def raise_keyboard_interrupt():
+		raise KeyboardInterrupt
+
+	monkeypatch.setattr(display.progress, 'start', raise_keyboard_interrupt)
+	try:
+		with pytest.raises(KeyboardInterrupt):
+			display.start()
+		assert sys.stdout is original_stdout
+	finally:
+		sys.stdout = original_stdout
+
+
 def test_format_progress_result_omits_missing_balance_and_reward():
 	result = {
 		'success': True,
@@ -296,4 +315,52 @@ async def test_tty_main_exception_cancels_sibling_and_replays_started_logs(monke
 	assert '[INFO] two started' in output
 	assert '[INFO] two cancelled' in output
 	first_heading = output.index('[one] 中断详情')
+	assert output.rfind('中断', 0, first_heading) != -1
+
+
+@pytest.mark.asyncio
+async def test_tty_main_exception_classifies_mixed_account_outcomes(monkeypatch):
+	stream = TtyBuffer()
+	monkeypatch.setattr(checkin, '_real_stdout', stream)
+	accounts = [
+		AccountConfig(cookies={'session': 'one'}, api_user='1', provider='agentrouter', name='one'),
+		AccountConfig(cookies={'session': 'two'}, api_user='2', provider='agentrouter', name='two'),
+		AccountConfig(cookies={'session': 'three'}, api_user='3', provider='agentrouter', name='three'),
+	]
+	_patch_main_dependencies(monkeypatch, accounts)
+	completed = set()
+	ready_to_raise = asyncio.Event()
+
+	async def fake_process(account, index, app_config):
+		if account.name == 'three':
+			await ready_to_raise.wait()
+			print('[FAILED] three crashed')
+			raise RuntimeError('mixed account error')
+
+		if account.name == 'one':
+			print('[INFO] one successful detail should stay hidden')
+			result = _account_result(account.name, success=True)
+		else:
+			print('[FAILED] two expected failure')
+			result = _account_result(account.name, success=False)
+		completed.add(account.name)
+		if completed == {'one', 'two'}:
+			ready_to_raise.set()
+		return result
+
+	monkeypatch.setattr(checkin, 'process_account_for_main', fake_process)
+	with pytest.raises(RuntimeError, match='mixed account error'):
+		await checkin.main()
+
+	output = stream.getvalue()
+	assert '完成 $31.80 (+25)' in output
+	assert '[one] 中断详情' not in output
+	assert '[one] 调试详情' not in output
+	assert '[INFO] one successful detail should stay hidden' not in output
+	assert '[two] 失败详情' in output
+	assert '[FAILED] two expected failure' in output
+	assert '[three] 中断详情' in output
+	assert '[FAILED] three crashed' in output
+	first_heading = min(output.index('[two] 失败详情'), output.index('[three] 中断详情'))
+	assert output.rfind('完成 $31.80 (+25)', 0, first_heading) != -1
 	assert output.rfind('中断', 0, first_heading) != -1
