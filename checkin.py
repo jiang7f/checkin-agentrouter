@@ -115,7 +115,9 @@ class _AccountProgressDisplay:
 			console=self.console,
 			auto_refresh=auto_refresh,
 			transient=False,
+			redirect_stdout=False,
 		)
+		self._original_stdout = None
 		width = max((len(log.name) for log in logs), default=0)
 		for index, log in enumerate(logs):
 			color = ('cyan', 'green', 'yellow', 'magenta', 'blue', 'red')[index % 6]
@@ -129,10 +131,23 @@ class _AccountProgressDisplay:
 			log.display = self
 
 	def start(self) -> None:
-		self.progress.start()
+		if self._original_stdout is None:
+			self._original_stdout = sys.stdout
+			sys.stdout = _ContextStdout()
+		try:
+			self.progress.start()
+		except Exception:
+			sys.stdout = self._original_stdout
+			self._original_stdout = None
+			raise
 
 	def stop(self) -> None:
-		self.progress.stop()
+		try:
+			self.progress.stop()
+		finally:
+			if self._original_stdout is not None:
+				sys.stdout = self._original_stdout
+				self._original_stdout = None
 
 	def refresh(self) -> None:
 		self.progress.refresh()
@@ -229,6 +244,27 @@ async def _heartbeat(active_logs: dict, interval: float = 5.0) -> None:
 					_real_stdout.flush()
 	except asyncio.CancelledError:
 		pass
+
+
+def _should_use_progress(concurrency: int, account_count: int) -> bool:
+	return concurrency > 1 and account_count > 1 and _real_stdout.isatty()
+
+
+def _print_buffered_account_logs(
+	logs: list[_AccountLog],
+	results: list[dict],
+	*,
+	include_success: bool,
+) -> None:
+	for log, result in zip(logs, results, strict=True):
+		if (result['success'] and not include_success) or not log.lines:
+			continue
+		heading = '调试详情' if result['success'] else '失败详情'
+		with _stdout_lock:
+			_real_stdout.write(f'\n[{log.name}] {heading}\n')
+			for line in log.lines:
+				_real_stdout.write(f'{log.prefix}{line}\n')
+			_real_stdout.flush()
 
 import httpx
 from cloakbrowser import launch_async
@@ -1484,33 +1520,54 @@ async def main():
 	concurrency = get_checkin_concurrency()
 	print(f'[INFO] Account concurrency: {concurrency}')
 	semaphore = asyncio.Semaphore(concurrency)
-	# 只有真正并发（并发数>1 且账号数>1）时才加账号前缀 + 心跳，单账号保持原始输出。
-	prefix_output = concurrency > 1 and len(accounts) > 1
-	prefix_width = max((len(a.get_display_name(i)) for i, a in enumerate(accounts)), default=0)
+	parallel_output = concurrency > 1 and len(accounts) > 1
+	progress_output = _should_use_progress(concurrency, len(accounts))
+	prefix_width = max((len(account.get_display_name(index)) for index, account in enumerate(accounts)), default=0)
+	account_logs = [
+		_AccountLog(
+			account.get_display_name(index),
+			_make_line_prefix(account.get_display_name(index), prefix_width, index),
+			emit_lines=not progress_output,
+		)
+		for index, account in enumerate(accounts)
+	]
+	progress_display = _AccountProgressDisplay(account_logs) if progress_output else None
 	active_logs: dict[int, _AccountLog] = {}
 
 	async def run_limited(index: int, account: AccountConfig) -> dict:
 		async with semaphore:
-			if not prefix_output:
+			if not parallel_output:
 				return await process_account_for_main(account, index, app_config)
-			name = account.get_display_name(index)
-			log = _AccountLog(name, _make_line_prefix(name, prefix_width, index))
+			log = account_logs[index]
 			token = _current_log.set(log)
 			active_logs[index] = log
 			try:
-				return await process_account_for_main(account, index, app_config)
+				result = await process_account_for_main(account, index, app_config)
+				if progress_display is not None:
+					if result['success']:
+						progress_display.finish(log, _format_progress_result(result))
+					else:
+						progress_display.fail(log)
+				return result
 			finally:
 				active_logs.pop(index, None)
 				_flush_log_partial(log)
 				_current_log.reset(token)
 
-	heartbeat_task = asyncio.create_task(_heartbeat(active_logs)) if prefix_output else None
+	heartbeat_task = asyncio.create_task(_heartbeat(active_logs)) if parallel_output and not progress_output else None
+	if progress_display is not None:
+		progress_display.start()
 	try:
 		account_results = await asyncio.gather(*(run_limited(i, account) for i, account in enumerate(accounts)))
 	finally:
 		if heartbeat_task is not None:
 			heartbeat_task.cancel()
 			await asyncio.gather(heartbeat_task, return_exceptions=True)
+		if progress_display is not None:
+			progress_display.stop()
+
+	if progress_output:
+		_print_buffered_account_logs(account_logs, account_results, include_success=is_debug_enabled())
 
 	for result in account_results:
 		if result['success']:
