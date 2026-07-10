@@ -4,10 +4,12 @@ AgentRouter 本地每日签到脚本
 """
 
 import asyncio
+import contextvars
 import hashlib
 import json
 import os
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -17,6 +19,96 @@ if hasattr(sys.stdout, 'reconfigure'):
 	sys.stdout.reconfigure(line_buffering=True)
 if hasattr(sys.stderr, 'reconfigure'):
 	sys.stderr.reconfigure(line_buffering=True)
+
+# 并发签到时，给每个账号的输出实时逐行加前缀（账号名），互不阻塞、谁先出谁先显示。
+# contextvars 会随 asyncio.to_thread 传入线程，因此浏览器/HTTP 线程里的 print 也会自动带上
+# 正确前缀，无需改动 utils/browser.py。此外用心跳定时汇报每个账号“卡在哪一步”，避免某步
+# 长时间阻塞（如浏览器登录）时看起来像卡死。
+_real_stdout = sys.stdout
+_stdout_lock = threading.Lock()
+_current_log: contextvars.ContextVar = contextvars.ContextVar('checkin_current_log', default=None)
+_PREFIX_COLORS = (36, 32, 33, 35, 34, 31)  # cyan / green / yellow / magenta / blue / red
+
+
+class _AccountLog:
+	"""记录单个账号的行前缀、未换行的残余内容，以及最近一条日志（供心跳展示当前步骤）。"""
+
+	__slots__ = ('name', 'prefix', 'partial', 'last_line', 'start')
+
+	def __init__(self, name: str, prefix: str):
+		self.name = name
+		self.prefix = prefix
+		self.partial = ''
+		self.last_line = ''
+		self.start = time.monotonic()
+
+
+class _ContextStdout:
+	"""按当前 context 决定是否加账号前缀；只对完整行加前缀，行内的部分写入先攒着。"""
+
+	def write(self, data):
+		log = _current_log.get()
+		if log is None:
+			return _real_stdout.write(data)
+		log.partial += data
+		lines = []
+		while '\n' in log.partial:
+			line, log.partial = log.partial.split('\n', 1)
+			if line.strip():
+				log.last_line = line.strip()
+			lines.append(f'{log.prefix}{line}\n')
+		if lines:
+			with _stdout_lock:
+				_real_stdout.write(''.join(lines))
+				_real_stdout.flush()
+		return len(data)
+
+	def flush(self):
+		if _current_log.get() is None:
+			_real_stdout.flush()
+
+	def __getattr__(self, name):
+		return getattr(_real_stdout, name)
+
+
+sys.stdout = _ContextStdout()
+
+
+def _make_line_prefix(name: str, width: int, index: int) -> str:
+	"""生成账号行前缀；在真实终端下按账号上色，日志文件里则用纯文本。"""
+	sep = f'{name.ljust(width)} │ '
+	if _real_stdout.isatty():
+		color = _PREFIX_COLORS[index % len(_PREFIX_COLORS)]
+		return f'\x1b[{color}m{sep}\x1b[0m'
+	return sep
+
+
+def _flush_log_partial(log: _AccountLog) -> None:
+	"""账号结束时，把没有换行结尾的残余内容补一个前缀后输出。"""
+	if not log.partial:
+		return
+	with _stdout_lock:
+		_real_stdout.write(f'{log.prefix}{log.partial}\n')
+		_real_stdout.flush()
+	log.partial = ''
+
+
+async def _heartbeat(active_logs: dict, interval: float = 5.0) -> None:
+	"""定时汇报仍在运行的账号已耗时和当前步骤，让长阻塞步骤不至于看起来卡死。"""
+	try:
+		while True:
+			await asyncio.sleep(interval)
+			with _stdout_lock:
+				parts = []
+				for log in active_logs.values():
+					elapsed = int(time.monotonic() - log.start)
+					step = log.last_line[:48] if log.last_line else 'working'
+					parts.append(f'{log.name} {elapsed}s（{step}）')
+				if parts:
+					_real_stdout.write('··· 进行中: ' + ' | '.join(parts) + '\n')
+					_real_stdout.flush()
+	except asyncio.CancelledError:
+		pass
 
 import httpx
 from cloakbrowser import launch_async
@@ -1042,6 +1134,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 				use_proxy=provider_config.use_proxy,
 			)
 			if user_info_after and user_info_after.get('success'):
+				print(user_info_after.get('display', f':money: Current balance: ${user_info_after["quota"]}'))
 				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by GitHub OAuth login)')
 				save_last_session(account_name, all_cookies, resolved_api_user)
 				return True, user_info_before, user_info_after
@@ -1260,12 +1353,33 @@ async def main():
 	concurrency = get_checkin_concurrency()
 	print(f'[INFO] Account concurrency: {concurrency}')
 	semaphore = asyncio.Semaphore(concurrency)
+	# 只有真正并发（并发数>1 且账号数>1）时才加账号前缀 + 心跳，单账号保持原始输出。
+	prefix_output = concurrency > 1 and len(accounts) > 1
+	prefix_width = max((len(a.get_display_name(i)) for i, a in enumerate(accounts)), default=0)
+	active_logs: dict[int, _AccountLog] = {}
 
 	async def run_limited(index: int, account: AccountConfig) -> dict:
 		async with semaphore:
-			return await process_account_for_main(account, index, app_config)
+			if not prefix_output:
+				return await process_account_for_main(account, index, app_config)
+			name = account.get_display_name(index)
+			log = _AccountLog(name, _make_line_prefix(name, prefix_width, index))
+			token = _current_log.set(log)
+			active_logs[index] = log
+			try:
+				return await process_account_for_main(account, index, app_config)
+			finally:
+				active_logs.pop(index, None)
+				_flush_log_partial(log)
+				_current_log.reset(token)
 
-	account_results = await asyncio.gather(*(run_limited(i, account) for i, account in enumerate(accounts)))
+	heartbeat_task = asyncio.create_task(_heartbeat(active_logs)) if prefix_output else None
+	try:
+		account_results = await asyncio.gather(*(run_limited(i, account) for i, account in enumerate(accounts)))
+	finally:
+		if heartbeat_task is not None:
+			heartbeat_task.cancel()
+			await asyncio.gather(heartbeat_task, return_exceptions=True)
 
 	for result in account_results:
 		if result['success']:
