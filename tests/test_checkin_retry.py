@@ -89,8 +89,9 @@ async def test_github_checkin_retries_reuse_one_previous_balance_query(monkeypat
 		*,
 		user_info_before=None,
 		query_previous_balance=True,
+		expire_profile_on_login_failure=False,
 	):
-		checkin_calls.append((user_info_before, query_previous_balance))
+		checkin_calls.append((user_info_before, query_previous_balance, expire_profile_on_login_failure))
 		if len(checkin_calls) < 6:
 			return False, user_info_before, {'success': False, 'error': 'temporary failure'}
 		return True, user_info_before, after
@@ -102,4 +103,4 @@ async def test_github_checkin_retries_reuse_one_previous_balance_query(monkeypat
 
 	assert result == (True, before, after)
 	assert query_calls == [3]
-	assert checkin_calls == [(before, False)] * 6
+	assert checkin_calls == [(before, False, False)] * 5 + [(before, False, True)]

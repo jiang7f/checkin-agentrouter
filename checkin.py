@@ -330,6 +330,7 @@ from utils.profiles import (
 	get_profile_status,
 	is_profile_dir_verified,
 	list_profile_names,
+	mark_profile_dir_valid,
 	mark_profile_expired,
 	mark_profile_verified,
 	validate_profile_name,
@@ -902,9 +903,9 @@ async def login_with_github_browser(
 
 	result = await perform_github_browser_login(account_name, provider_config, provider_name, settings)
 	if not result:
-		mark_profile_expired(provider_name, profile_name, profile_root=get_profile_root())
-		print(f'[HINT] {account_name}: GitHub login may have expired. Run: {CLI_COMMAND} add {profile_name}')
+		print(f'[WARN] {account_name}: GitHub login attempt failed; profile status unchanged')
 		return None
+	mark_profile_dir_valid(settings.profile_dir)
 	return result
 
 
@@ -1330,6 +1331,7 @@ async def check_in_account(
 	*,
 	user_info_before: dict | None = None,
 	query_previous_balance: bool = True,
+	expire_profile_on_login_failure: bool = False,
 ):
 	"""为单个账号执行签到操作"""
 	account_name = account.get_display_name(account_index)
@@ -1376,6 +1378,10 @@ async def check_in_account(
 			print(f'[FAILED] {account_name}: Auto check-in failed - {error}')
 			return False, user_info_before, user_info_after
 		else:
+			if expire_profile_on_login_failure:
+				profile_name = account.browser_profile or account_name
+				mark_profile_expired(account.provider, profile_name, profile_root=get_profile_root())
+				print(f'[HINT] {account_name}: GitHub login may have expired. Run: {CLI_COMMAND} add {profile_name}')
 			print(f'[FAILED] {account_name}: GitHub browser login failed, will not use stale session cookies')
 			return False, user_info_before, None
 	elif account.has_login_credentials():
@@ -1455,6 +1461,7 @@ async def check_in_account_with_retries(
 				app_config,
 				user_info_before=user_info_before,
 				query_previous_balance=False,
+				expire_profile_on_login_failure=attempt == max_attempts,
 			)
 		else:
 			last_result = await check_in_account(account, account_index, app_config)

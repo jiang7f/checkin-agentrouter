@@ -99,10 +99,12 @@ checkin-agentrouter list
 
 ```text
 valid    GitHub profile 已验证
-expired  每日运行时登录失败，可能需要重新 add
+expired  连续 6 次 GitHub OAuth 登录失败，可能需要重新 add
 saved    本地 profile 目录存在
 configured  .env 中配置了这个名字
 ```
+
+单次 OAuth 或 AgentRouter 接口临时失败不会把 profile 标记为 `expired`。后续登录成功时，历史上的错误过期标记会自动恢复为 `valid`。
 
 如果同名 profile 仍是 `valid`，`add` 会询问是否覆盖。如果已经 `expired`，会直接覆盖。
 

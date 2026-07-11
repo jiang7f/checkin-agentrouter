@@ -104,3 +104,35 @@ def mark_profile_expired(
 		json.dumps(marker, ensure_ascii=False, separators=(',', ':')),
 		profile_root=profile_root,
 	)
+
+
+def mark_profile_valid(
+	provider: str,
+	profile_name: str,
+	*,
+	profile_root: Path | None = None,
+) -> Path:
+	marker = read_profile_marker(provider, profile_name, profile_root=profile_root)
+	marker['status'] = 'valid'
+	return mark_profile_verified(
+		provider,
+		profile_name,
+		json.dumps(marker, ensure_ascii=False, separators=(',', ':')),
+		profile_root=profile_root,
+	)
+
+
+def mark_profile_dir_valid(profile_dir: Path) -> Path:
+	marker_path = profile_dir / PROFILE_MARKER_FILE
+	marker = {}
+	if marker_path.exists():
+		try:
+			data = json.loads(marker_path.read_text(encoding='utf-8'))
+			if isinstance(data, dict):
+				marker = data
+		except json.JSONDecodeError:
+			pass
+	marker['status'] = 'valid'
+	marker_path.parent.mkdir(parents=True, exist_ok=True)
+	marker_path.write_text(json.dumps(marker, ensure_ascii=False, separators=(',', ':')), encoding='utf-8')
+	return marker_path

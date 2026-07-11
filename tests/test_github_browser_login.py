@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -6,7 +7,7 @@ import pytest
 import checkin
 from utils.browser import BrowserLoginSettings
 from utils.config import AccountConfig, AppConfig, ProviderConfig
-from utils.profiles import is_profile_expired
+from utils.profiles import is_profile_expired, read_profile_marker
 
 
 @pytest.mark.asyncio
@@ -162,7 +163,7 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 		github_auth_path='/api/oauth/github',
 	)
 	(tmp_path / 'existing-profile').mkdir()
-	(tmp_path / 'existing-profile' / '.anyrouter-profile.json').write_text('{}')
+	(tmp_path / 'existing-profile' / '.anyrouter-profile.json').write_text('{"status":"expired"}')
 
 	account = AccountConfig(
 		name='profile_main',
@@ -187,6 +188,7 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 	assert settings_seen['session_wait'][1] == 60_000
 	assert settings_seen['verify'][1] == 'https://agentrouter.org/console'
 	assert context.closed is True
+	assert json.loads((tmp_path / 'existing-profile' / '.anyrouter-profile.json').read_text())['status'] == 'valid'
 
 
 @pytest.mark.asyncio
@@ -325,7 +327,7 @@ async def test_login_with_github_browser_rejects_unverified_profile(monkeypatch,
 
 
 @pytest.mark.asyncio
-async def test_login_with_github_browser_marks_verified_profile_expired_on_failed_login(monkeypatch, tmp_path):
+async def test_login_with_github_browser_keeps_profile_valid_after_single_failure(monkeypatch, tmp_path):
 	profile_root = tmp_path / 'profiles'
 	profile_dir = profile_root / 'agentrouter' / 'profile_main'
 	profile_dir.mkdir(parents=True)
@@ -368,6 +370,98 @@ async def test_login_with_github_browser_marks_verified_profile_expired_on_faile
 	result = await checkin.login_with_github_browser(account, 'profile_main', provider, 'agentrouter')
 
 	assert result is None
+	assert not is_profile_expired('agentrouter', 'profile_main', profile_root=profile_root)
+
+
+@pytest.mark.asyncio
+async def test_login_with_github_browser_restores_expired_profile_after_success(monkeypatch, tmp_path):
+	profile_root = tmp_path / 'profiles'
+	profile_dir = profile_root / 'agentrouter' / 'profile_main'
+	profile_dir.mkdir(parents=True)
+	marker = {
+		'provider': 'agentrouter',
+		'profile': 'profile_main',
+		'api_user': '123456',
+		'verified_at': '2026-07-09 13:40:07',
+		'status': 'expired',
+	}
+	(profile_dir / '.anyrouter-profile.json').write_text(json.dumps(marker))
+
+	def fake_load_browser_login_settings(
+		account_name,
+		provider_name,
+		*,
+		persist_profile,
+		browser_profile=None,
+		reset_profile=False,
+	):
+		return BrowserLoginSettings(
+			headless=True,
+			humanize=True,
+			wait_timeout_ms=60_000,
+			profile_dir=profile_dir,
+			cloakbrowser_binary_path=None,
+			persist_profile=True,
+			browser_profile=browser_profile,
+		)
+
+	async def fake_perform_github_browser_login(*args, **kwargs):
+		return checkin.BrowserLoginResult(cookies={'session': 'new-session'}, api_user='123456')
+
+	monkeypatch.setenv('CHECKIN_BROWSER_PROFILE_DIR', str(profile_root))
+	monkeypatch.setattr(checkin, 'load_browser_login_settings', fake_load_browser_login_settings)
+	monkeypatch.setattr(checkin, 'perform_github_browser_login', fake_perform_github_browser_login)
+	account = AccountConfig(
+		name='profile_main',
+		provider='agentrouter',
+		cookies=None,
+		api_user=None,
+		github_browser=True,
+		browser_profile='profile_main',
+	)
+	provider = ProviderConfig(name='agentrouter', domain='https://agentrouter.org')
+
+	result = await checkin.login_with_github_browser(account, 'profile_main', provider, 'agentrouter')
+
+	assert result == checkin.BrowserLoginResult(cookies={'session': 'new-session'}, api_user='123456')
+	assert read_profile_marker('agentrouter', 'profile_main', profile_root=profile_root) == {
+		**marker,
+		'status': 'valid',
+	}
+
+
+@pytest.mark.asyncio
+async def test_check_in_account_expires_profile_only_when_final_login_failure_is_authorized(monkeypatch, tmp_path):
+	profile_root = tmp_path / 'profiles'
+	profile_dir = profile_root / 'agentrouter' / 'profile_main'
+	profile_dir.mkdir(parents=True)
+	(profile_dir / '.anyrouter-profile.json').write_text('{"status":"valid"}')
+	account = AccountConfig(
+		name='profile_main',
+		provider='agentrouter',
+		cookies=None,
+		api_user=None,
+		github_browser=True,
+		browser_profile='profile_main',
+	)
+	provider = ProviderConfig(name='agentrouter', domain='https://agentrouter.org')
+	app_config = AppConfig(providers={'agentrouter': provider})
+
+	async def fake_login_with_github_browser(*args, **kwargs):
+		return None
+
+	monkeypatch.setenv('CHECKIN_BROWSER_PROFILE_DIR', str(profile_root))
+	monkeypatch.setattr(checkin, 'login_with_github_browser', fake_login_with_github_browser)
+
+	result = await checkin.check_in_account(
+		account,
+		0,
+		app_config,
+		query_previous_balance=False,
+		expire_profile_on_login_failure=True,
+	)
+
+	assert result == (False, None, None)
 	assert is_profile_expired('agentrouter', 'profile_main', profile_root=profile_root)
 
 
