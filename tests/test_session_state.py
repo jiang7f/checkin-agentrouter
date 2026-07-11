@@ -158,6 +158,7 @@ async def test_github_browser_checkin_uses_previous_session_for_before_balance(m
 	}
 	assert steps == [
 		(1, '查询签到前余额'),
+		(1, '查询签到前余额 1/3'),
 		(2, 'GitHub OAuth 登录'),
 		(3, '查询签到后余额'),
 		(4, '保存状态'),
@@ -347,8 +348,8 @@ async def test_github_checkin_reuses_live_before_balance_after_same_day_checkin(
 		'_checked_in_by_script_today': True,
 	}
 
-	async def fake_check_in_with_previous_session(account_arg, account_index, app_config_arg, *, max_attempts=3):
-		return False, before, None
+	async def fake_query_previous_session_balance(account_arg, account_index, app_config_arg, *, max_attempts=3):
+		return before
 
 	async def fake_login_with_github_browser(account_arg, account_name, provider_config, provider_name):
 		return checkin.BrowserLoginResult(
@@ -357,7 +358,7 @@ async def test_github_checkin_reuses_live_before_balance_after_same_day_checkin(
 			user_profile={'id': 194538, 'quota': 0, 'used_quota': 0},
 		)
 
-	monkeypatch.setattr(checkin, 'check_in_with_previous_session', fake_check_in_with_previous_session)
+	monkeypatch.setattr(checkin, 'query_previous_session_balance', fake_query_previous_session_balance)
 	monkeypatch.setattr(checkin, 'login_with_github_browser', fake_login_with_github_browser)
 	monkeypatch.setattr(checkin, 'save_last_session', lambda *args: None)
 
@@ -371,95 +372,6 @@ async def test_github_checkin_reuses_live_before_balance_after_same_day_checkin(
 		'used_quota': 23.77,
 		'display': ':money: Current balance: $226.23, Used: $23.77',
 	}
-
-
-@pytest.mark.asyncio
-async def test_successful_previous_session_checkin_skips_github_oauth(monkeypatch):
-	account = AccountConfig(
-		name='profile_main',
-		provider='agentrouter',
-		cookies=None,
-		api_user=None,
-		github_browser=True,
-		browser_profile='profile_main',
-	)
-	provider = ProviderConfig(name='agentrouter', domain='https://agentrouter.org', sign_in_path=None)
-	app_config = AppConfig(providers={'agentrouter': provider})
-	before = {'success': True, 'quota': 8.23, 'used_quota': 191.77}
-	after = {'success': True, 'quota': 33.23, 'used_quota': 191.77}
-
-	async def fake_check_in_with_previous_session(account_arg, account_index, app_config_arg, *, max_attempts=3):
-		return True, before, after
-
-	async def fail_login_with_github_browser(*args, **kwargs):
-		raise AssertionError('OAuth must not run when the saved session check-in succeeds')
-
-	monkeypatch.setattr(checkin, 'check_in_with_previous_session', fake_check_in_with_previous_session)
-	monkeypatch.setattr(checkin, 'login_with_github_browser', fail_login_with_github_browser)
-
-	result = await checkin.check_in_account_with_retries(account, 0, app_config)
-
-	assert result == (True, before, after)
-
-
-@pytest.mark.asyncio
-async def test_previous_session_checkin_retries_zero_balance_and_saves_success(monkeypatch):
-	account = AccountConfig(
-		name='profile_main',
-		provider='agentrouter',
-		cookies=None,
-		api_user=None,
-		github_browser=True,
-		browser_profile='profile_main',
-	)
-	provider = ProviderConfig(name='agentrouter', domain='https://agentrouter.org', sign_in_path=None)
-	app_config = AppConfig(providers={'agentrouter': provider})
-	before = {'success': True, 'quota': 8.23, 'used_quota': 191.77}
-	after = {'success': True, 'quota': 33.23, 'used_quota': 191.77}
-	attempts = 0
-	sleeps = []
-	saved = []
-
-	async def fake_prepare_cookies(account_name, provider_config, user_cookies):
-		assert user_cookies == {'session': 'old-session'}
-		return {'acw_tc': f'waf-{attempts + 1}', **user_cookies}
-
-	def fake_run_check_in_requests(
-		cookies,
-		account_arg,
-		account_name,
-		provider_config,
-		*,
-		api_user_override=None,
-		use_proxy=False,
-	):
-		nonlocal attempts
-		attempts += 1
-		assert cookies['session'] == 'old-session'
-		assert api_user_override == 'old-user'
-		if attempts == 1:
-			return True, before, {'success': True, 'quota': 0, 'used_quota': 0}
-		return True, before, after
-
-	async def fake_sleep(delay):
-		sleeps.append(delay)
-
-	monkeypatch.setattr(
-		checkin,
-		'load_last_session',
-		lambda account_name: {'cookies': {'session': 'old-session'}, 'api_user': 'old-user'},
-	)
-	monkeypatch.setattr(checkin, 'prepare_cookies', fake_prepare_cookies)
-	monkeypatch.setattr(checkin, 'run_check_in_requests', fake_run_check_in_requests)
-	monkeypatch.setattr(checkin.asyncio, 'sleep', fake_sleep)
-	monkeypatch.setattr(checkin, 'save_last_session', lambda *args: saved.append(args))
-
-	result = await checkin.check_in_with_previous_session(account, 0, app_config)
-
-	assert result == (True, before, after)
-	assert attempts == 2
-	assert sleeps == [1]
-	assert saved == [('profile_main', {'session': 'old-session'}, 'old-user')]
 
 
 @pytest.mark.asyncio
@@ -507,6 +419,54 @@ async def test_github_oauth_gate_limits_only_login_phase_to_two(monkeypatch):
 
 	assert max_active == 2
 	assert all(result[0] for result in results)
+
+
+@pytest.mark.asyncio
+async def test_previous_balance_gate_serializes_cookie_queries(monkeypatch):
+	provider = ProviderConfig(name='agentrouter', domain='https://agentrouter.org', sign_in_path=None)
+	app_config = AppConfig(providers={'agentrouter': provider})
+	accounts = [
+		AccountConfig(
+			name=f'profile_{index}',
+			provider='agentrouter',
+			cookies=None,
+			api_user=None,
+			github_browser=True,
+			browser_profile=f'profile_{index}',
+		)
+		for index in range(2)
+	]
+	active = 0
+	max_active = 0
+
+	async def fake_prepare_cookies(account_name, provider_config, user_cookies):
+		nonlocal active, max_active
+		active += 1
+		max_active = max(max_active, active)
+		await asyncio.sleep(0.01)
+		active -= 1
+		return user_cookies
+
+	def fake_run_user_info_request(*args, **kwargs):
+		return {'success': True, 'quota': 25.0, 'used_quota': 200.0}
+
+	monkeypatch.setattr(
+		checkin,
+		'load_last_session',
+		lambda account_name: {'cookies': {'session': f'session-{account_name}'}, 'api_user': account_name},
+	)
+	monkeypatch.setattr(checkin, 'prepare_cookies', fake_prepare_cookies)
+	monkeypatch.setattr(checkin, 'run_user_info_request', fake_run_user_info_request)
+	token = checkin._previous_balance_gate.set(asyncio.Semaphore(1))
+	try:
+		results = await asyncio.gather(
+			*(checkin.query_previous_session_balance(account, index, app_config) for index, account in enumerate(accounts))
+		)
+	finally:
+		checkin._previous_balance_gate.reset(token)
+
+	assert max_active == 1
+	assert all(result and result['quota'] == 25.0 for result in results)
 
 
 @pytest.mark.asyncio

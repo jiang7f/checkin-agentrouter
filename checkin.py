@@ -33,8 +33,8 @@ _current_log: contextvars.ContextVar = contextvars.ContextVar('checkin_current_l
 _oauth_gate: contextvars.ContextVar[asyncio.Semaphore | None] = contextvars.ContextVar(
 	'checkin_oauth_gate', default=None
 )
-_session_checkin_gate: contextvars.ContextVar[asyncio.Semaphore | None] = contextvars.ContextVar(
-	'checkin_session_checkin_gate', default=None
+_previous_balance_gate: contextvars.ContextVar[asyncio.Semaphore | None] = contextvars.ContextVar(
+	'checkin_previous_balance_gate', default=None
 )
 _PREFIX_COLORS = (36, 32, 33, 35, 34, 31)  # cyan / green / yellow / magenta / blue / red
 
@@ -1441,44 +1441,53 @@ async def query_previous_session_balance(
 		print(f'[INFO] {account_name}: No previous AgentRouter session; first run will not show check-in increment')
 		return None
 
-	print(f'[INFO] {account_name}: Reading balance with previous AgentRouter session')
-	# 旧状态只持久化 session cookie。WAF cookie 仅为本轮查询临时补齐，不写入本地状态。
-	max_attempts = max(max_attempts, 1)
-	for attempt in range(1, max_attempts + 1):
-		before_cookies = await prepare_cookies(account_name, provider_config, previous_session['cookies'])
+	async def run_attempts() -> dict | None:
+		print(f'[INFO] {account_name}: Reading balance with previous AgentRouter session')
+		# 旧状态只持久化 session cookie。WAF cookie 仅为本轮查询临时补齐，不写入本地状态。
+		max_attempt_count = max(max_attempts, 1)
+		for attempt in range(1, max_attempt_count + 1):
+			_set_account_step(1, f'查询签到前余额 {attempt}/{max_attempt_count}')
+			before_cookies = await prepare_cookies(account_name, provider_config, previous_session['cookies'])
 
-		if before_cookies:
-			user_info_before = await asyncio.to_thread(
-				run_user_info_request,
-				before_cookies,
-				account,
-				account_name,
-				provider_config,
-				api_user_override=previous_session.get('api_user'),
-				use_proxy=provider_config.use_proxy,
-			)
-			if user_info_before and user_info_before.get('success'):
-				if previous_session.get('checkin_date') == datetime.now().date().isoformat():
-					user_info_before['_checked_in_by_script_today'] = True
-				print(user_info_before.get('display', f':money: Current balance: ${user_info_before["quota"]}'))
-				return user_info_before
-			error = user_info_before.get('error', 'Unknown error') if user_info_before else 'No response'
-			print(
-				f'[WARN] {account_name}: Previous session balance query failed '
-				f'({attempt}/{max_attempts}): {error}'
-			)
-		else:
-			print(
-				f'[WARN] {account_name}: Unable to prepare WAF cookies for previous-session balance query '
-				f'({attempt}/{max_attempts})'
-			)
+			if before_cookies:
+				user_info_before = await asyncio.to_thread(
+					run_user_info_request,
+					before_cookies,
+					account,
+					account_name,
+					provider_config,
+					api_user_override=previous_session.get('api_user'),
+					use_proxy=provider_config.use_proxy,
+				)
+				if user_info_before and user_info_before.get('success'):
+					if previous_session.get('checkin_date') == datetime.now().date().isoformat():
+						user_info_before['_checked_in_by_script_today'] = True
+					print(user_info_before.get('display', f':money: Current balance: ${user_info_before["quota"]}'))
+					return user_info_before
+				error = user_info_before.get('error', 'Unknown error') if user_info_before else 'No response'
+				print(
+					f'[WARN] {account_name}: Previous session balance query failed '
+					f'({attempt}/{max_attempt_count}): {error}'
+				)
+			else:
+				print(
+					f'[WARN] {account_name}: Unable to prepare WAF cookies for previous-session balance query '
+					f'({attempt}/{max_attempt_count})'
+				)
 
-		if attempt < max_attempts:
-			print(f'[RETRY] {account_name}: retrying previous-session balance query')
-			await asyncio.sleep(1)
+			if attempt < max_attempt_count:
+				print(f'[RETRY] {account_name}: retrying previous-session balance query')
+				await asyncio.sleep(1)
 
-	print(f'[WARN] {account_name}: Previous-session balance unavailable; check-in increment will be omitted')
-	return None
+		print(f'[WARN] {account_name}: Previous-session balance unavailable; check-in increment will be omitted')
+		return None
+
+	gate = _previous_balance_gate.get()
+	if gate is None:
+		return await run_attempts()
+	_set_account_step(1, '等待签到前余额查询槽位')
+	async with gate:
+		return await run_attempts()
 
 
 def user_info_has_balance(user_info: dict | None) -> bool:
@@ -1490,71 +1499,6 @@ def user_info_has_balance(user_info: dict | None) -> bool:
 	except (KeyError, TypeError, ValueError):
 		return False
 	return quota != 0 or used_quota != 0
-
-
-async def check_in_with_previous_session(
-	account: AccountConfig,
-	account_index: int,
-	app_config: AppConfig,
-	*,
-	max_attempts: int = 3,
-) -> tuple[bool, dict | None, dict | None] | None:
-	"""优先复用上次成功 session，按原版流程自动签到并查询前后余额。"""
-	account_name = account.get_display_name(account_index)
-	provider_config = app_config.get_provider(account.provider)
-	if not provider_config:
-		return None
-	previous_session = load_last_session(account_name)
-	if not previous_session:
-		print(f'[INFO] {account_name}: No previous AgentRouter session; falling back to GitHub OAuth')
-		return None
-
-	async def run_attempts() -> tuple[bool, dict | None, dict | None]:
-		best_before = None
-		max_attempt_count = max(max_attempts, 1)
-		for attempt in range(1, max_attempt_count + 1):
-			_set_account_step(1, f'Session Cookie 自动签到 {attempt}/{max_attempt_count}')
-			all_cookies = await prepare_cookies(account_name, provider_config, previous_session['cookies'])
-			if all_cookies:
-				result = await asyncio.to_thread(
-					run_check_in_requests,
-					all_cookies,
-					account,
-					account_name,
-					provider_config,
-					api_user_override=previous_session.get('api_user'),
-					use_proxy=provider_config.use_proxy,
-				)
-				success, user_info_before, user_info_after = result
-				if user_info_has_balance(user_info_before):
-					best_before = user_info_before
-				if success and user_info_has_balance(user_info_after):
-					_set_account_step(4, '保存状态')
-					save_last_session(
-						account_name,
-						previous_session['cookies'],
-						previous_session.get('api_user'),
-					)
-					return True, user_info_before, user_info_after
-				print(
-					f'[WARN] {account_name}: Session Cookie check-in returned no usable balance '
-					f'({attempt}/{max_attempt_count})'
-				)
-			else:
-				print(
-					f'[WARN] {account_name}: Unable to prepare cookies for Session Cookie check-in '
-					f'({attempt}/{max_attempt_count})'
-				)
-			if attempt < max_attempt_count:
-				await asyncio.sleep(1)
-		return False, best_before, None
-
-	gate = _session_checkin_gate.get()
-	if gate is None:
-		return await run_attempts()
-	_set_account_step(1, '等待 Session Cookie 签到槽位')
-	async with gate:
-		return await run_attempts()
 
 
 async def query_post_login_balance(
@@ -1700,17 +1644,7 @@ async def check_in_account_with_retries(
 
 	_set_account_attempt(1, max_attempts)
 	if is_github_browser:
-		previous_session_result = await check_in_with_previous_session(
-			account,
-			account_index,
-			app_config,
-			max_attempts=3,
-		)
-		if previous_session_result is not None:
-			previous_success, previous_before, _ = previous_session_result
-			if previous_success:
-				return previous_session_result
-			user_info_before = previous_before
+		user_info_before = await query_previous_session_balance(account, account_index, app_config, max_attempts=3)
 
 	for attempt in range(1, max_attempts + 1):
 		if attempt > 1:
@@ -1893,7 +1827,7 @@ async def main():
 	print(f'[INFO] GitHub OAuth concurrency: {oauth_concurrency}')
 	semaphore = asyncio.Semaphore(concurrency)
 	oauth_semaphore = asyncio.Semaphore(oauth_concurrency)
-	session_checkin_semaphore = asyncio.Semaphore(1)
+	previous_balance_semaphore = asyncio.Semaphore(1)
 	parallel_output = concurrency > 1 and len(accounts) > 1
 	progress_output = _should_use_progress(concurrency, len(accounts))
 	prefix_width = max((len(account.get_display_name(index)) for index, account in enumerate(accounts)), default=0)
@@ -1934,7 +1868,7 @@ async def main():
 
 	heartbeat_task = asyncio.create_task(_heartbeat(active_logs)) if parallel_output and not progress_output else None
 	oauth_gate_token = _oauth_gate.set(oauth_semaphore)
-	session_checkin_gate_token = _session_checkin_gate.set(session_checkin_semaphore)
+	previous_balance_gate_token = _previous_balance_gate.set(previous_balance_semaphore)
 	try:
 		account_tasks: list[asyncio.Task] = []
 		if progress_display is not None:
@@ -1970,7 +1904,7 @@ async def main():
 			)
 		raise
 	finally:
-		_session_checkin_gate.reset(session_checkin_gate_token)
+		_previous_balance_gate.reset(previous_balance_gate_token)
 		_oauth_gate.reset(oauth_gate_token)
 
 	if progress_output:

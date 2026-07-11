@@ -132,7 +132,7 @@ CHECKIN_OAUTH_CONCURRENCY=2
 
 网络错误、WAF 空响应或 OAuth 接口临时失败不会把浏览器 profile 标记为过期。只有浏览器明确跳到 GitHub 登录页时，`list` 才会显示 `expired` 并提示重新执行 `checkin-agentrouter add <name>`。
 
-AgentRouter 账号会先复用上次成功保存的 session，按原版流程补齐新的 WAF cookie，然后连续请求两次 `/api/user/self` 完成自动签到并取得签到前后余额。这个阶段最多尝试 3 次，并在账号之间串行执行，避免同一 IP 并发查询时返回 HTML 或随机零值。只有 session 失效或连续查询失败时，才进入 GitHub OAuth，最多尝试 6 次。
+AgentRouter 账号会先复用上次成功保存的 session，按原版方法补齐新的 WAF cookie，只查询签到前余额。这个阶段最多尝试 3 次，并在账号之间串行执行，避免同一 IP 并发查询时返回 HTML 或随机零值。Cookie 查询无论成功还是失败，都不会被当作签到成功，后续仍会退出旧登录态并执行 GitHub OAuth，最多尝试 6 次。
 
 GitHub OAuth 成功后会优先复用浏览器已返回的真实余额。如果 OAuth 回调页没有返回资料或只返回了零值占位数据，脚本会在同一 CloakBrowser context 中新建一个干净页面。新页面共享刚获得的 session 和 WAF cookies，但不带 OAuth 页面的登录态清理脚本。控制台会先渲染零值占位数据，再异步更新真实余额，所以脚本会留在同一页面轮询“当前余额”和“历史消耗”组件，最多尝试 3 次，不会用刷新打断数据加载。余额查询失败不会重新执行 OAuth，也不会用未验证的新 session 覆盖上一次成功 session。如果本地签到日期明确是今天，并且签到前已经实时查到余额，浏览器余额仍失败时才会复用这个当天余额。跨天或旧版状态没有日期标记时不会回退，避免把历史余额误报为本次余额。
 
