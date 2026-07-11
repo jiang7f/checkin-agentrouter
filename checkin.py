@@ -330,6 +330,7 @@ from utils.browser import (
 	login_with_email_form,
 	navigate_login_page,
 	prepare_browser_page,
+	read_browser_user_profile,
 	save_login_screenshot,
 	take_pending_screenshots,
 	verify_browser_login,
@@ -446,7 +447,12 @@ def load_last_session(account_name: str) -> dict | None:
 	api_user = session.get('api_user')
 	if not isinstance(cookies, dict) or not cookies.get('session'):
 		return None
-	return {'cookies': cookies, 'api_user': api_user if isinstance(api_user, str) else None}
+	checkin_date = session.get('checkin_date')
+	return {
+		'cookies': cookies,
+		'api_user': api_user if isinstance(api_user, str) else None,
+		'checkin_date': checkin_date if isinstance(checkin_date, str) else None,
+	}
 
 
 def save_last_session(account_name: str, cookies: dict, api_user: str | None) -> None:
@@ -454,7 +460,11 @@ def save_last_session(account_name: str, cookies: dict, api_user: str | None) ->
 	if not session_cookie:
 		return
 	sessions = load_last_sessions()
-	sessions[account_name] = {'cookies': {'session': session_cookie}, 'api_user': api_user}
+	sessions[account_name] = {
+		'cookies': {'session': session_cookie},
+		'api_user': api_user,
+		'checkin_date': datetime.now().date().isoformat(),
+	}
 	save_last_sessions(sessions)
 
 
@@ -694,6 +704,31 @@ def _github_profile_requires_login(oauth_page) -> bool:
 	return oauth_page is not None and not oauth_page.is_closed() and oauth_page.url.startswith(GITHUB_LOGIN_URL)
 
 
+async def query_browser_post_login_profile(
+	page,
+	account_name: str,
+	api_user: str | None,
+	initial_profile: dict | None,
+	*,
+	max_attempts: int = 3,
+) -> dict | None:
+	"""OAuth 浏览器关闭前，用同一上下文独立重试余额资料。"""
+	candidate = initial_profile
+	max_attempts = max(max_attempts, 1)
+	for attempt in range(1, max_attempts + 1):
+		_set_account_step(3, f'查询签到后余额 {attempt}/{max_attempts}')
+		if user_info_from_browser_profile(candidate):
+			return candidate
+		candidate = await read_browser_user_profile(page, api_user=api_user)
+		if user_info_from_browser_profile(candidate):
+			return candidate
+		print(f'[WARN] {account_name}: Browser balance query failed ({attempt}/{max_attempts})')
+		if attempt < max_attempts:
+			# 控制台会先渲染 $0.00 占位值，再异步更新真实余额。刷新会重新开始加载。
+			await asyncio.sleep(2)
+	return initial_profile
+
+
 async def perform_github_browser_login(
 	account_name: str,
 	provider_config,
@@ -797,7 +832,32 @@ async def perform_github_browser_login(
 			await context.close()
 			return None
 		api_user = str(user_profile['id']) if user_profile and user_profile.get('id') is not None else None
-
+		if not user_info_from_browser_profile(user_profile):
+			balance_page = await context.new_page()
+			try:
+				await prepare_browser_page(balance_page)
+				await balance_page.goto(
+					console_url,
+					wait_until='domcontentloaded',
+					timeout=min(timeout_ms, 60_000),
+				)
+				user_profile = await query_browser_post_login_profile(
+					balance_page,
+					account_name,
+					api_user,
+					user_profile,
+				)
+				if not user_info_from_browser_profile(user_profile):
+					await save_login_screenshot(
+						balance_page,
+						provider_name,
+						account_name,
+						'post-login-balance-unavailable',
+					)
+			finally:
+				await balance_page.close()
+			if api_user is None and user_profile and user_profile.get('id') is not None:
+				api_user = str(user_profile['id'])
 		print(f'[SUCCESS] {account_name}: GitHub browser login successful, got {len(all_cookies)} cookies')
 		await context.close()
 		return BrowserLoginResult(cookies=all_cookies, api_user=api_user, user_profile=user_profile)
@@ -1395,6 +1455,8 @@ async def query_previous_session_balance(
 				use_proxy=provider_config.use_proxy,
 			)
 			if user_info_before and user_info_before.get('success'):
+				if previous_session.get('checkin_date') == datetime.now().date().isoformat():
+					user_info_before['_checked_in_by_script_today'] = True
 				print(user_info_before.get('display', f':money: Current balance: ${user_info_before["quota"]}'))
 				return user_info_before
 			error = user_info_before.get('error', 'Unknown error') if user_info_before else 'No response'
@@ -1421,32 +1483,12 @@ async def query_post_login_balance(
 	account_name: str,
 	provider_config,
 	login_result: BrowserLoginResult,
-	*,
-	max_attempts: int = 3,
 ) -> dict | None:
-	"""OAuth 成功后快速查询余额，失败时不重新登录。"""
+	"""读取 OAuth 浏览器在关闭前已经查询到的余额。"""
 	user_info = user_info_from_browser_profile(login_result.user_profile)
 	if user_info:
 		print(f'[INFO] {account_name}: Reusing user info verified in browser')
 		return user_info
-
-	max_attempts = max(max_attempts, 1)
-	for attempt in range(1, max_attempts + 1):
-		user_info = await asyncio.to_thread(
-			run_user_info_request,
-			login_result.cookies,
-			account,
-			account_name,
-			provider_config,
-			api_user_override=login_result.api_user,
-			use_proxy=provider_config.use_proxy,
-		)
-		if user_info and user_info.get('success'):
-			return user_info
-		error = user_info.get('error', 'Unknown error') if user_info else 'No response'
-		print(f'[WARN] {account_name}: Post-login balance query failed ({attempt}/{max_attempts}): {error}')
-		if attempt < max_attempts:
-			await asyncio.sleep(1)
 
 	print(f'[WARN] {account_name}: Check-in succeeded but post-login balance is unavailable')
 	return None
@@ -1459,7 +1501,6 @@ async def check_in_account(
 	*,
 	user_info_before: dict | None = None,
 	query_previous_balance: bool = True,
-	expire_profile_on_login_failure: bool = False,
 ):
 	"""为单个账号执行签到操作"""
 	account_name = account.get_display_name(account_index)
@@ -1500,6 +1541,11 @@ async def check_in_account(
 				provider_config,
 				login_result,
 			)
+			if user_info_after is None and user_info_before and user_info_before.get('_checked_in_by_script_today'):
+				user_info_after = {
+					key: value for key, value in user_info_before.items() if not key.startswith('_')
+				}
+				print(f'[INFO] {account_name}: Reusing live balance because this script already checked in today')
 			if user_info_after and user_info_after.get('success'):
 				print(user_info_after.get('display', f':money: Current balance: ${user_info_after["quota"]}'))
 			print(f'[INFO] {account_name}: Check-in completed automatically (triggered by GitHub OAuth login)')
@@ -1507,10 +1553,6 @@ async def check_in_account(
 			save_last_session(account_name, all_cookies, resolved_api_user)
 			return True, user_info_before, user_info_after
 		else:
-			if expire_profile_on_login_failure:
-				profile_name = account.browser_profile or account_name
-				mark_profile_expired(account.provider, profile_name, profile_root=get_profile_root())
-				print(f'[HINT] {account_name}: GitHub login may have expired. Run: {CLI_COMMAND} add {profile_name}')
 			print(f'[FAILED] {account_name}: GitHub browser login failed, will not use stale session cookies')
 			return False, user_info_before, None
 	elif account.has_login_credentials():
@@ -1590,7 +1632,6 @@ async def check_in_account_with_retries(
 				app_config,
 				user_info_before=user_info_before,
 				query_previous_balance=False,
-				expire_profile_on_login_failure=attempt == max_attempts,
 			)
 		else:
 			last_result = await check_in_account(account, account_index, app_config)
@@ -1631,7 +1672,12 @@ async def process_account_for_main(
 			need_notify = True
 			if account.uses_github_browser():
 				profile_name = account.browser_profile or account_name
-				account_detail['failure_hint'] = f'可能需要重新登录: {CLI_COMMAND} add {profile_name}'
+				if get_profile_status(
+					account.provider,
+					profile_name,
+					profile_root=get_profile_root(),
+				) == 'expired':
+					account_detail['failure_hint'] = f'需要重新登录: {CLI_COMMAND} add {profile_name}'
 			print(f'[NOTIFY] {account_name} failed, will send notification')
 
 		if user_info_after and user_info_after.get('success'):

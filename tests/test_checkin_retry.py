@@ -106,7 +106,7 @@ async def test_github_checkin_retries_reuse_one_previous_balance_query(monkeypat
 
 	assert result == (True, before, after)
 	assert query_calls == [3]
-	assert checkin_calls == [(before, False, False)] * 5 + [(before, False, True)]
+	assert checkin_calls == [(before, False, False)] * 6
 
 
 @pytest.mark.asyncio

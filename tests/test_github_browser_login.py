@@ -49,7 +49,11 @@ async def test_check_in_account_uses_github_browser_before_cookie_auth(monkeypat
 
 	async def fake_login_with_github_browser(account_arg, account_name, provider_config, provider_name):
 		calls['github_browser'] = (account_arg, account_name, provider_config.name, provider_name)
-		return checkin.BrowserLoginResult(cookies={'session': 'new-session'}, api_user='new-api-user')
+		return checkin.BrowserLoginResult(
+			cookies={'session': 'new-session'},
+			api_user='new-api-user',
+			user_profile={'id': 123456, 'quota': 17_500_000, 'used_quota': 0},
+		)
 
 	def fake_run_user_info_request(cookies, account_arg, account_name, provider_config, **kwargs):
 		calls['check_in'] = {
@@ -71,11 +75,14 @@ async def test_check_in_account_uses_github_browser_before_cookie_auth(monkeypat
 
 	assert result[0] is True
 	assert result[1] is None
-	assert result[2] == {'success': True, 'quota': 35, 'used_quota': 0}
+	assert result[2] == {
+		'success': True,
+		'quota': 35.0,
+		'used_quota': 0.0,
+		'display': ':money: Current balance: $35.0, Used: $0.0',
+	}
 	assert calls['github_browser'] == (account, 'github-account', 'agentrouter', 'agentrouter')
-	assert calls['check_in']['cookies'] == {'session': 'new-session'}
-	assert calls['check_in']['api_user_override'] == 'new-api-user'
-	assert calls['check_in']['use_proxy'] is True
+	assert 'check_in' not in calls
 
 
 @pytest.mark.asyncio
@@ -125,6 +132,9 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 
 		async def add_init_script(self, script):
 			self.init_scripts.append(script)
+
+		async def close(self):
+			self.closed = True
 
 		def is_closed(self):
 			return self.closed
@@ -186,6 +196,10 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 		settings_seen['verify'] = (page, console_url, timeout_ms)
 		return None
 
+	async def fake_query_browser_post_login_profile(page, account_name, api_user, initial_profile, *, max_attempts=3):
+		settings_seen['balance_query'] = (page, account_name, api_user, initial_profile, max_attempts)
+		return None
+
 	monkeypatch.setattr(checkin, 'load_browser_login_settings', fake_load_browser_login_settings)
 	monkeypatch.setattr(checkin, 'launch_login_context', fake_launch_login_context)
 	monkeypatch.setattr(checkin, 'prepare_browser_page', fake_prepare_browser_page)
@@ -195,6 +209,7 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 	monkeypatch.setattr(checkin, 'confirm_github_oauth', fake_confirm_github_oauth, raising=False)
 	monkeypatch.setattr(checkin, 'wait_for_session_cookie', fake_wait_for_session_cookie, raising=False)
 	monkeypatch.setattr(checkin, 'verify_browser_login', fake_verify_browser_login)
+	monkeypatch.setattr(checkin, 'query_browser_post_login_profile', fake_query_browser_post_login_profile)
 	monkeypatch.setattr(
 		checkin,
 		'load_last_session',
@@ -231,7 +246,7 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 	assert '.agentrouter.org' in context.cleared_domains
 	assert 'github.com' not in context.cleared_domains
 	assert any("localStorage.removeItem('user')" in script for script in context.page.init_scripts)
-	assert context.page.urls == ['https://agentrouter.org/login']
+	assert context.page.urls == ['https://agentrouter.org/login', 'https://agentrouter.org/console']
 	assert settings_seen['navigate'][1] == 'https://agentrouter.org/login'
 	assert settings_seen['github_click'][2:] == ('agentrouter', 'profile_main')
 	assert context.page.wait_for_url_timeouts == []
@@ -240,6 +255,7 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 	assert settings_seen['session_baseline'][1] == 'https://agentrouter.org'
 	assert settings_seen['session_wait'][1:] == (8_000, 'https://agentrouter.org', 'login-session')
 	assert settings_seen['verify'][1] == 'https://agentrouter.org/console'
+	assert settings_seen['balance_query'] == (context.page, 'profile_main', None, None, 3)
 	assert context.closed is True
 	assert json.loads((tmp_path / 'existing-profile' / '.anyrouter-profile.json').read_text())['status'] == 'valid'
 
@@ -284,6 +300,9 @@ async def test_github_browser_login_falls_back_to_auth_url_when_click_stays_on_l
 		async def evaluate(self, script):
 			return {'clientId': 'github-client-id', 'state': 'oauth-state'}
 
+		async def close(self):
+			pass
+
 	context = FakeContext()
 	baselines = iter(('login-session', 'oauth-state-session'))
 	calls = {}
@@ -305,10 +324,15 @@ async def test_github_browser_login_falls_back_to_auth_url_when_click_stays_on_l
 
 	async def fake_wait_for_session_cookie(page, timeout_ms, *, cookie_url=None, previous_value=None):
 		calls['previous_value'] = previous_value
+		page.url = 'https://agentrouter.org/console'
 		return True
 
 	async def fake_verify_browser_login(page, console_url, timeout_ms):
-		return {'id': 123456}
+		return None
+
+	async def fake_query_browser_post_login_profile(page, account_name, api_user, initial_profile, *, max_attempts=3):
+		calls['balance_query'] = (page, account_name, api_user, initial_profile, max_attempts)
+		return {'id': 123456, 'quota': 12_625_000, 'used_quota': 112_375_000}
 
 	monkeypatch.setattr(checkin, 'launch_login_context', fake_launch_login_context)
 	monkeypatch.setattr(checkin, 'prepare_browser_page', fake_prepare_browser_page)
@@ -317,6 +341,7 @@ async def test_github_browser_login_falls_back_to_auth_url_when_click_stays_on_l
 	monkeypatch.setattr(checkin, 'get_session_cookie_value', fake_get_session_cookie_value, raising=False)
 	monkeypatch.setattr(checkin, 'wait_for_session_cookie', fake_wait_for_session_cookie, raising=False)
 	monkeypatch.setattr(checkin, 'verify_browser_login', fake_verify_browser_login)
+	monkeypatch.setattr(checkin, 'query_browser_post_login_profile', fake_query_browser_post_login_profile)
 	settings = BrowserLoginSettings(
 		headless=True,
 		humanize=True,
@@ -337,8 +362,9 @@ async def test_github_browser_login_falls_back_to_auth_url_when_click_stays_on_l
 	assert result == checkin.BrowserLoginResult(
 		cookies={'session': 'new-session'},
 		api_user='123456',
-		user_profile={'id': 123456},
+		user_profile={'id': 123456, 'quota': 12_625_000, 'used_quota': 112_375_000},
 	)
+	assert calls['balance_query'] == (context.page, 'profile_main', None, None, 3)
 	assert (
 		'https://github.com/login/oauth/authorize?client_id=github-client-id&state=oauth-state&scope=user%3Aemail'
 		in context.page.urls
@@ -499,7 +525,7 @@ async def test_login_with_github_browser_restores_expired_profile_after_success(
 
 
 @pytest.mark.asyncio
-async def test_check_in_account_expires_profile_only_when_final_login_failure_is_authorized(monkeypatch, tmp_path):
+async def test_check_in_account_does_not_expire_profile_on_transient_login_failure(monkeypatch, tmp_path):
 	profile_root = tmp_path / 'profiles'
 	profile_dir = profile_root / 'agentrouter' / 'profile_main'
 	profile_dir.mkdir(parents=True)
@@ -526,11 +552,10 @@ async def test_check_in_account_expires_profile_only_when_final_login_failure_is
 		0,
 		app_config,
 		query_previous_balance=False,
-		expire_profile_on_login_failure=True,
 	)
 
 	assert result == (False, None, None)
-	assert is_profile_expired('agentrouter', 'profile_main', profile_root=profile_root)
+	assert not is_profile_expired('agentrouter', 'profile_main', profile_root=profile_root)
 
 
 @pytest.mark.asyncio

@@ -12,13 +12,15 @@ def test_last_session_state_round_trips_by_account_name(monkeypatch, tmp_path):
 	monkeypatch.setenv('CHECKIN_LAST_SESSIONS_FILE', str(state_file))
 
 	checkin.save_last_session('profile_main', {'session': 'new-session', 'other': 'ignored'}, '123456')
+	today = checkin.datetime.now().date().isoformat()
 
 	assert json.loads(state_file.read_text(encoding='utf-8')) == {
-		'profile_main': {'cookies': {'session': 'new-session'}, 'api_user': '123456'}
+		'profile_main': {'cookies': {'session': 'new-session'}, 'api_user': '123456', 'checkin_date': today}
 	}
 	assert checkin.load_last_session('profile_main') == {
 		'cookies': {'session': 'new-session'},
 		'api_user': '123456',
+		'checkin_date': today,
 	}
 
 
@@ -116,7 +118,11 @@ async def test_github_browser_checkin_uses_previous_session_for_before_balance(m
 	steps = []
 
 	async def fake_login_with_github_browser(account_arg, account_name, provider_config, provider_name):
-		return checkin.BrowserLoginResult(cookies={'session': 'new-session', 'other': 'value'}, api_user='new-user')
+		return checkin.BrowserLoginResult(
+			cookies={'session': 'new-session', 'other': 'value'},
+			api_user='new-user',
+			user_profile={'id': 123456, 'quota': 62_500_000, 'used_quota': 25_000_000},
+		)
 
 	def fake_run_user_info_request(cookies, account_arg, account_name, provider_config, *, api_user_override=None, use_proxy=False):
 		calls.append((dict(cookies), api_user_override))
@@ -144,14 +150,19 @@ async def test_github_browser_checkin_uses_previous_session_for_before_balance(m
 
 	assert result[0] is True
 	assert result[1] == {'success': True, 'quota': 100.0, 'used_quota': 50.0}
-	assert result[2] == {'success': True, 'quota': 125.0, 'used_quota': 50.0}
+	assert result[2] == {
+		'success': True,
+		'quota': 125.0,
+		'used_quota': 50.0,
+		'display': ':money: Current balance: $125.0, Used: $50.0',
+	}
 	assert steps == [
 		(1, '查询签到前余额'),
 		(2, 'GitHub OAuth 登录'),
 		(3, '查询签到后余额'),
 		(4, '保存状态'),
 	]
-	assert calls == [({'session': 'old-session'}, 'old-user'), ({'session': 'new-session', 'other': 'value'}, 'new-user')]
+	assert calls == [({'session': 'old-session'}, 'old-user')]
 	assert saved == {'account_name': 'profile_main', 'cookies': {'session': 'new-session', 'other': 'value'}, 'api_user': 'new-user'}
 
 
@@ -273,10 +284,93 @@ async def test_github_browser_checkin_does_not_repeat_oauth_when_post_balance_is
 	result = await checkin.check_in_account_with_retries(account, 0, app_config)
 
 	assert result == (True, None, None)
-	assert calls == {'login': 1, 'prepare': 0, 'user_info': 3}
-	assert request_cookies == [{'session': 'new-session'}] * 3
-	assert sleeps == [1, 1]
+	assert calls == {'login': 1, 'prepare': 0, 'user_info': 0}
+	assert request_cookies == []
+	assert sleeps == []
 	assert saved == {'account_name': 'profile_main', 'cookies': {'session': 'new-session'}, 'api_user': 'new-user'}
+
+
+@pytest.mark.asyncio
+async def test_browser_post_login_balance_retries_three_times_in_same_context(monkeypatch):
+	placeholder = {'id': 123456, 'quota': 0, 'used_quota': 0}
+	populated = {'id': 123456, 'quota': 12_625_000, 'used_quota': 112_375_000}
+	profiles = [placeholder, placeholder, populated]
+	steps = []
+	sleeps = []
+	page = object()
+
+	async def fake_read_browser_user_profile(page_arg, *, api_user=None):
+		assert page_arg is page
+		assert api_user == '123456'
+		return profiles.pop(0)
+
+	async def fake_sleep(delay):
+		sleeps.append(delay)
+
+	monkeypatch.setattr(checkin, 'read_browser_user_profile', fake_read_browser_user_profile)
+	monkeypatch.setattr(checkin, '_set_account_step', lambda step, message: steps.append((step, message)))
+	monkeypatch.setattr(checkin.asyncio, 'sleep', fake_sleep)
+
+	result = await checkin.query_browser_post_login_profile(
+		page,
+		'profile_main',
+		'123456',
+		placeholder,
+	)
+
+	assert result == populated
+	assert steps == [
+		(3, '查询签到后余额 1/3'),
+		(3, '查询签到后余额 2/3'),
+		(3, '查询签到后余额 3/3'),
+	]
+	assert sleeps == [2, 2]
+
+
+@pytest.mark.asyncio
+async def test_github_checkin_reuses_live_before_balance_after_same_day_checkin(monkeypatch):
+	account = AccountConfig(
+		name='profile_main',
+		provider='agentrouter',
+		cookies=None,
+		api_user=None,
+		github_browser=True,
+		browser_profile='profile_main',
+	)
+	provider = ProviderConfig(name='agentrouter', domain='https://agentrouter.org', sign_in_path=None)
+	app_config = AppConfig(providers={'agentrouter': provider})
+	before = {
+		'success': True,
+		'quota': 226.23,
+		'used_quota': 23.77,
+		'display': ':money: Current balance: $226.23, Used: $23.77',
+		'_checked_in_by_script_today': True,
+	}
+
+	async def fake_query_previous_session_balance(account_arg, account_index, app_config_arg, *, max_attempts=3):
+		return before
+
+	async def fake_login_with_github_browser(account_arg, account_name, provider_config, provider_name):
+		return checkin.BrowserLoginResult(
+			cookies={'session': 'new-session'},
+			api_user='194538',
+			user_profile={'id': 194538, 'quota': 0, 'used_quota': 0},
+		)
+
+	monkeypatch.setattr(checkin, 'query_previous_session_balance', fake_query_previous_session_balance)
+	monkeypatch.setattr(checkin, 'login_with_github_browser', fake_login_with_github_browser)
+	monkeypatch.setattr(checkin, 'save_last_session', lambda *args: None)
+
+	result = await checkin.check_in_account_with_retries(account, 0, app_config)
+
+	assert result[0] is True
+	assert result[1] == before
+	assert result[2] == {
+		'success': True,
+		'quota': 226.23,
+		'used_quota': 23.77,
+		'display': ':money: Current balance: $226.23, Used: $23.77',
+	}
 
 
 @pytest.mark.asyncio
@@ -343,7 +437,11 @@ async def test_previous_session_balance_retries_three_times_before_checkin(monke
 	sleeps = []
 
 	async def fake_login_with_github_browser(account_arg, account_name, provider_config, provider_name):
-		return checkin.BrowserLoginResult(cookies={'session': 'new-session'}, api_user='new-user')
+		return checkin.BrowserLoginResult(
+			cookies={'session': 'new-session'},
+			api_user='new-user',
+			user_profile={'id': 123456, 'quota': 12_625_000, 'used_quota': 112_375_000},
+		)
 
 	async def fake_sleep(delay):
 		sleeps.append(delay)
@@ -373,7 +471,12 @@ async def test_previous_session_balance_retries_three_times_before_checkin(monke
 	assert result == (
 		True,
 		{'success': True, 'quota': 75.2, 'used_quota': 149.8},
-		{'success': True, 'quota': 25.25, 'used_quota': 224.75},
+		{
+			'success': True,
+			'quota': 25.25,
+			'used_quota': 224.75,
+			'display': ':money: Current balance: $25.25, Used: $224.75',
+		},
 	)
 	assert old_session_attempts == 3
 	assert load_calls == ['profile_main']
@@ -394,7 +497,11 @@ async def test_github_browser_first_checkin_has_no_before_balance(monkeypatch):
 	app_config = AppConfig(providers={'agentrouter': provider})
 
 	async def fake_login_with_github_browser(account_arg, account_name, provider_config, provider_name):
-		return checkin.BrowserLoginResult(cookies={'session': 'new-session'}, api_user='new-user')
+		return checkin.BrowserLoginResult(
+			cookies={'session': 'new-session'},
+			api_user='new-user',
+			user_profile={'id': 123456, 'quota': 62_500_000, 'used_quota': 25_000_000},
+		)
 
 	def fake_run_user_info_request(cookies, account_arg, account_name, provider_config, *, api_user_override=None, use_proxy=False):
 		return {'success': True, 'quota': 125.0, 'used_quota': 50.0}
@@ -408,7 +515,12 @@ async def test_github_browser_first_checkin_has_no_before_balance(monkeypatch):
 
 	assert result[0] is True
 	assert result[1] is None
-	assert result[2] == {'success': True, 'quota': 125.0, 'used_quota': 50.0}
+	assert result[2] == {
+		'success': True,
+		'quota': 125.0,
+		'used_quota': 50.0,
+		'display': ':money: Current balance: $125.0, Used: $50.0',
+	}
 
 
 @pytest.mark.asyncio
@@ -437,7 +549,11 @@ async def test_before_balance_query_prepends_waf_cookies(monkeypatch):
 		return {'acw_tc': 'waf-token', **user_cookies}
 
 	async def fake_login_with_github_browser(account_arg, account_name, provider_config, provider_name):
-		return checkin.BrowserLoginResult(cookies={'session': 'new-session'}, api_user='new-user')
+		return checkin.BrowserLoginResult(
+			cookies={'session': 'new-session'},
+			api_user='new-user',
+			user_profile={'id': 123456, 'quota': 62_500_000, 'used_quota': 25_000_000},
+		)
 
 	def fake_run_user_info_request(cookies, account_arg, account_name, provider_config, *, api_user_override=None, use_proxy=False):
 		if cookies.get('session') == 'old-session':
@@ -485,7 +601,11 @@ async def test_before_balance_skipped_when_waf_cookies_unavailable(monkeypatch):
 		return None
 
 	async def fake_login_with_github_browser(account_arg, account_name, provider_config, provider_name):
-		return checkin.BrowserLoginResult(cookies={'session': 'new-session'}, api_user='new-user')
+		return checkin.BrowserLoginResult(
+			cookies={'session': 'new-session'},
+			api_user='new-user',
+			user_profile={'id': 123456, 'quota': 62_500_000, 'used_quota': 25_000_000},
+		)
 
 	def fake_run_user_info_request(cookies, account_arg, account_name, provider_config, *, api_user_override=None, use_proxy=False):
 		assert cookies.get('session') != 'old-session', 'before query must be skipped when WAF cookies unavailable'
@@ -505,4 +625,9 @@ async def test_before_balance_skipped_when_waf_cookies_unavailable(monkeypatch):
 
 	assert result[0] is True
 	assert result[1] is None
-	assert result[2] == {'success': True, 'quota': 125.0, 'used_quota': 50.0}
+	assert result[2] == {
+		'success': True,
+		'quota': 125.0,
+		'used_quota': 50.0,
+		'display': ':money: Current balance: $125.0, Used: $50.0',
+	}

@@ -8,6 +8,7 @@ from utils.browser import (
 	confirm_github_oauth,
 	launch_login_context,
 	load_browser_login_settings,
+	read_browser_user_profile,
 	verify_browser_login,
 	wait_for_session_cookie,
 )
@@ -245,6 +246,95 @@ async def test_verify_browser_login_accepts_zero_balance_storage_identity_immedi
 
 	assert result == placeholder
 	assert sleeps == []
+
+
+@pytest.mark.asyncio
+async def test_read_browser_user_profile_fetches_balance_with_api_user_header():
+	placeholder = {'id': 123456, 'quota': 0, 'used_quota': 0}
+	populated = {'id': 123456, 'quota': 12_625_000, 'used_quota': 112_375_000}
+
+	class FakePage:
+		def __init__(self):
+			self.fetch_args = None
+
+		async def evaluate(self, expression, *args):
+			if not args:
+				return placeholder
+			self.fetch_args = args[0]
+			return {'success': True, 'data': populated}
+
+	page = FakePage()
+	result = await read_browser_user_profile(page, api_user='123456')
+
+	assert result == populated
+	assert page.fetch_args == {'path': '/api/user/self', 'apiUser': '123456'}
+
+
+@pytest.mark.asyncio
+async def test_read_browser_user_profile_prefers_console_balance():
+	placeholder = {'id': 123456, 'quota': 0, 'used_quota': 0}
+
+	class FakeLocator:
+		def __init__(self, text):
+			self.first = self
+			self.text = text
+
+		async def count(self):
+			return 1
+
+		async def evaluate(self, expression):
+			return self.text
+
+	class FakePage:
+		async def evaluate(self, expression, *args):
+			if args:
+				raise AssertionError('API fetch should not run when console balance is available')
+			return placeholder
+
+		def get_by_text(self, label, exact=True):
+			values = {
+				'当前余额': '当前余额\n$226.23',
+				'历史消耗': '历史消耗\n$23.77',
+			}
+			return FakeLocator(values[label])
+
+	result = await read_browser_user_profile(FakePage(), api_user='194538')
+
+	assert result == {
+		'id': '194538',
+		'quota': 113_115_000,
+		'used_quota': 11_885_000,
+	}
+
+
+@pytest.mark.asyncio
+async def test_read_browser_user_profile_ignores_zero_console_placeholder_and_fetches_api():
+	placeholder = {'id': 123456, 'quota': 0, 'used_quota': 0}
+	populated = {'id': 123456, 'quota': 12_625_000, 'used_quota': 112_375_000}
+
+	class FakeLocator:
+		def __init__(self, text):
+			self.first = self
+			self.text = text
+
+		async def wait_for(self, **kwargs):
+			pass
+
+		async def evaluate(self, expression):
+			return self.text
+
+	class FakePage:
+		def get_by_text(self, label, exact=True):
+			return FakeLocator(f'{label}\n$0.00')
+
+		async def evaluate(self, expression, *args):
+			if not args:
+				return placeholder
+			return {'success': True, 'data': populated}
+
+	result = await read_browser_user_profile(FakePage(), api_user='123456')
+
+	assert result == populated
 
 
 @pytest.mark.asyncio

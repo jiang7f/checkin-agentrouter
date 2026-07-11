@@ -210,7 +210,11 @@ async def test_check_in_account_passes_browser_profile_to_github_login(monkeypat
 
 	async def fake_login_with_github_browser(account_arg, account_name, provider_config, provider_name):
 		calls['login'] = (account_arg.browser_profile, account_name, provider_config.name, provider_name)
-		return checkin.BrowserLoginResult(cookies={'session': 'new-session'}, api_user='123456')
+		return checkin.BrowserLoginResult(
+			cookies={'session': 'new-session'},
+			api_user='123456',
+			user_profile={'id': 123456, 'quota': 17_500_000, 'used_quota': 0},
+		)
 
 	def fake_run_user_info_request(cookies, account_arg, account_name, provider_config, **kwargs):
 		calls['check_in'] = kwargs
@@ -225,6 +229,11 @@ async def test_check_in_account_passes_browser_profile_to_github_login(monkeypat
 
 	assert result[0] is True
 	assert result[1] is None
-	assert result[2] == {'success': True, 'quota': 35, 'used_quota': 0}
+	assert result[2] == {
+		'success': True,
+		'quota': 35.0,
+		'used_quota': 0.0,
+		'display': ':money: Current balance: $35.0, Used: $0.0',
+	}
 	assert calls['login'] == ('profile_main', 'github-account', 'agentrouter', 'agentrouter')
-	assert calls['check_in']['api_user_override'] == '123456'
+	assert 'check_in' not in calls

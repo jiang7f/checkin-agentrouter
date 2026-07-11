@@ -1,4 +1,7 @@
+import pytest
+
 import checkin
+from utils.config import AccountConfig
 
 
 def line_containing(content: str, text: str) -> str:
@@ -101,3 +104,35 @@ def test_should_not_send_notification_without_event(monkeypatch):
 	monkeypatch.delenv('ALWAYS_NOTIFY', raising=False)
 
 	assert not checkin.should_send_notification(need_notify=False, balance_changed=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+	('profile_status', 'expected_hint'),
+	[
+		('valid', None),
+		('expired', '需要重新登录: checkin-agentrouter add profile_main'),
+	],
+)
+async def test_failed_github_account_only_suggests_login_when_profile_expired(
+	monkeypatch,
+	profile_status,
+	expected_hint,
+):
+	account = AccountConfig(
+		name='profile_main',
+		provider='agentrouter',
+		cookies=None,
+		github_browser=True,
+		browser_profile='profile_main',
+	)
+
+	async def fake_check_in_account_with_retries(account_arg, account_index, app_config):
+		return False, None, None
+
+	monkeypatch.setattr(checkin, 'check_in_account_with_retries', fake_check_in_account_with_retries)
+	monkeypatch.setattr(checkin, 'get_profile_status', lambda *args, **kwargs: profile_status)
+
+	result = await checkin.process_account_for_main(account, 0, object())
+
+	assert result['daily_detail'].get('failure_hint') == expected_hint

@@ -453,6 +453,117 @@ async def _read_stored_user_profile(page: Page) -> dict | None:
 	return _extract_user_profile(payload)
 
 
+def _profile_has_populated_quota(profile: dict | None) -> bool:
+	if not profile:
+		return False
+	try:
+		quota = float(profile['quota'])
+		used_quota = float(profile['used_quota'])
+	except (KeyError, TypeError, ValueError):
+		return False
+	return quota != 0 or used_quota != 0
+
+
+async def _read_console_money_value(page: Page, labels: tuple[str, ...]) -> float | None:
+	for label in labels:
+		try:
+			locator = page.get_by_text(label, exact=True).first
+			try:
+				await locator.wait_for(state='visible', timeout=2_000)
+			except Exception:  # nosec B110
+				if await locator.count() == 0:
+					continue
+			text = await locator.evaluate('(el) => el.parentElement?.innerText || ""')
+		except Exception:  # nosec B112
+			continue
+		match = re.search(r'\$\s*([0-9]+(?:\.[0-9]+)?)', str(text))
+		if match:
+			return float(match.group(1))
+	return None
+
+
+async def _read_console_balance_profile(page: Page, *, api_user: str | None) -> dict | None:
+	quota = await _read_console_money_value(page, ('当前余额', 'Current Balance', 'Current balance'))
+	used_quota = await _read_console_money_value(page, ('历史消耗', 'Historical Usage', 'Historical usage'))
+	if quota is None or used_quota is None:
+		return None
+	return {
+		'id': api_user or 'console',
+		'quota': round(quota * 500_000),
+		'used_quota': round(used_quota * 500_000),
+	}
+
+
+async def read_browser_user_profile(page: Page, *, api_user: str | None = None) -> dict | None:
+	"""在当前浏览器上下文中读取用户资料，必要时主动请求用户接口。"""
+	stored_profile = await _read_stored_user_profile(page)
+	console_profile = await _read_console_balance_profile(
+		page,
+		api_user=api_user or (str(stored_profile['id']) if stored_profile and stored_profile.get('id') else None),
+	)
+	if _profile_has_populated_quota(console_profile):
+		return console_profile
+	if _profile_has_populated_quota(stored_profile):
+		return stored_profile
+
+	try:
+		payload = await page.evaluate(
+			"""async ({ path, apiUser }) => {
+				let fallback = null;
+				for (const headerUser of [null, apiUser]) {
+					if (headerUser === null && fallback !== null) continue;
+					if (headerUser !== null && !headerUser) continue;
+					try {
+					const headers = { Accept: 'application/json' };
+					if (headerUser) headers['New-Api-User'] = headerUser;
+					const response = await fetch(path, {
+						cache: 'no-store',
+						credentials: 'include',
+						headers,
+					});
+						if (!response.ok) continue;
+						const payload = await response.json();
+						const profile = payload?.data ?? payload;
+						fallback ??= payload;
+						if (Number(profile?.quota) !== 0 || Number(profile?.used_quota) !== 0) {
+							return payload;
+						}
+					} catch {
+						// Try the alternate header form.
+					}
+				}
+				return fallback;
+			}""",
+			{'path': USER_SELF_API_SUFFIX, 'apiUser': api_user},
+		)
+	except Exception:  # nosec B110
+		return stored_profile or console_profile
+	fetched_profile = _extract_user_profile(payload)
+	if _profile_has_populated_quota(fetched_profile):
+		return fetched_profile
+	if is_debug_enabled():
+		try:
+			title = await page.title()
+		except Exception:  # nosec B110
+			title = ''
+		try:
+			body_text = await page.locator('body').inner_text(timeout=2_000)
+		except Exception:  # nosec B110
+			body_text = ''
+		stored_summary = None
+		if stored_profile:
+			stored_summary = {
+				'id': stored_profile.get('id'),
+				'quota': stored_profile.get('quota'),
+				'used_quota': stored_profile.get('used_quota'),
+			}
+		debug_print(
+			f'[DEBUG] Browser balance unavailable: url={page.url!r}, title={title!r}, '
+			f'stored={stored_summary!r}, body={body_text[:500]!r}'
+		)
+	return fetched_profile or stored_profile or console_profile
+
+
 async def is_logged_in(page: Page) -> bool:
 	"""快速判断：是否在 /console，或仍停留在登录页。"""
 	url = page.url.lower()
