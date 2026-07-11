@@ -46,14 +46,35 @@ uv run python -m cloakbrowser install
 cp .env.example .env
 ```
 
-最小配置如下：
+推荐基础配置如下，可以直接写入 `.env`：
 
 ```dotenv
 AGENTROUTER_ACCOUNTS=[]
-FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/replace-with-your-token
+CHECKIN_PROXY_URL=http://127.0.0.1:7890
+PROVIDERS={"agentrouter":{"domain":"https://agentrouter.org","use_proxy":true}}
+
+# 可选：配置后发送签到结果到飞书
+# FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/replace-with-your-token
 ```
 
-`add` 命令会自动把 profile 名称写入 `AGENTROUTER_ACCOUNTS`，因此也可以先保留空数组。
+这几项分别表示：
+
+- `AGENTROUTER_ACCOUNTS=[]`：首次安装先使用空账号列表。`add` 命令会自动加入账号名称，不需要手动编辑 JSON。
+- `CHECKIN_PROXY_URL`：本机代理的 HTTP 或 mixed 端口。示例使用 `7890`，如果 Clash、Mihomo 或其他代理软件使用不同端口，必须改成实际端口。
+- `PROVIDERS`：明确指定 AgentRouter 使用代理。项目内置配置目前也是 `use_proxy=true`，保留这一行可以让实际网络行为在 `.env` 中一目了然。
+- `FEISHU_WEBHOOK`：可选。不配置不会影响签到，只是不发送飞书消息。
+
+`PROVIDERS` 必须保持为一行合法 JSON，键名和字符串使用双引号。不要改成 Python 风格的单引号，也不要在 JSON 内添加注释。
+
+`CHECKIN_PROXY_URL` 必须是本机可连接的代理地址，不是机场订阅链接。添加账号前建议先检查代理：
+
+```bash
+nc -z 127.0.0.1 7890
+curl -I --proxy http://127.0.0.1:7890 https://github.com
+curl -I --proxy http://127.0.0.1:7890 https://agentrouter.org
+```
+
+如果端口不是 `7890`，上面的配置和检查命令都要一起修改。`curl` 返回的具体 HTTP 状态可能受 WAF 影响，只要能够建立连接且没有代理连接失败或超时即可。
 
 ### 3. 添加账号
 
@@ -62,6 +83,20 @@ uv run python checkin.py add main
 ```
 
 浏览器打开后，在该浏览器中完成 GitHub 登录。需要二次验证时也在同一窗口完成。脚本确认 GitHub 登录成功后会保存 profile，并把 `main` 写入 `.env`。
+
+`main` 只是本地显示名称，不需要与 GitHub 用户名相同。建议使用简短且容易辨认的名称。每次执行 `add` 都会创建一个独立浏览器 profile，因此添加第二个账号时要在新窗口中确认登录的是目标 GitHub 账号。
+
+添加完成后检查状态：
+
+```bash
+uv run python checkin.py list
+```
+
+正常结果应包含：
+
+```text
+✅ main  (configured, saved, valid)
+```
 
 每个 profile 对应一个 GitHub 账号。添加其他账号时使用不同名称：
 
@@ -74,6 +109,15 @@ uv run python checkin.py add backup
 ```bash
 uv run python checkin.py
 ```
+
+首次运行会创建 `last_sessions.json` 和 `balance_hash.txt`。第一次没有上次成功 Session，因此可能只显示当前余额，不显示 `本次签到+xx`。从下一次运行开始，签到前后余额都查询成功时才会显示本次增量。
+
+如果首次运行失败，先看进度停在哪个阶段：
+
+- `等待 OAuth 槽位`：正在等待其他账号释放 OAuth 并发槽位，不是故障。
+- `GitHub OAuth 登录`：优先检查 GitHub profile 和代理连接。
+- `查询签到前余额`：旧 Session 尚不存在或临时查询失败，不影响后续 OAuth 签到。
+- `查询签到后余额`：OAuth 已成功，脚本正在使用新 Session 独立重试余额查询。
 
 ## 本地短命令
 
@@ -234,6 +278,7 @@ Profile 默认保存在：
 | `AGENTROUTER_ACCOUNTS` | 无 | AgentRouter 浏览器 profile 名称数组 |
 | `FEISHU_WEBHOOK` | 无 | 飞书机器人 Webhook |
 | `CHECKIN_PROXY_URL` | 无 | AgentRouter 和 GitHub OAuth 使用的 HTTP 代理 |
+| `PROVIDERS` | 内置配置 | 使用一行 JSON 覆盖 Provider 配置，例如明确启用 AgentRouter 代理 |
 | `CHECKIN_CONCURRENCY` | `3` | 同时执行的账号数 |
 | `CHECKIN_OAUTH_CONCURRENCY` | `2` | 同时执行的 GitHub OAuth 数 |
 | `ALWAYS_NOTIFY` | `false` | 即使余额未变化且没有失败也发送通知 |
@@ -247,13 +292,14 @@ Profile 默认保存在：
 | `CHECKIN_SCREENSHOT_DIR` | `checkin_screenshots` | 调试截图目录 |
 | `CLOAKBROWSER_BINARY_PATH` | 自动管理 | 手动指定 CloakBrowser 浏览器路径 |
 
-如果本地网络访问 AgentRouter 需要代理：
+AgentRouter 推荐明确配置代理地址和 Provider 开关：
 
 ```dotenv
 CHECKIN_PROXY_URL=http://127.0.0.1:7890
+PROVIDERS={"agentrouter":{"domain":"https://agentrouter.org","use_proxy":true}}
 ```
 
-`PROXY_SUBSCRIPTION_URL` 可以保留在本地配置中供代理工具使用，但签到脚本实际读取的是 `CHECKIN_PROXY_URL`。
+浏览器 OAuth、WAF Cookie 获取和 HTTP 余额查询都会使用这个代理。`PROXY_SUBSCRIPTION_URL` 可以保留在本地配置中供代理工具使用，但签到脚本实际读取的是 `CHECKIN_PROXY_URL`。
 
 高级用户仍可通过 `ANYROUTER_ACCOUNTS` 和 `PROVIDERS` 使用通用 Provider 配置。AgentRouter 浏览器 profile 推荐只使用 `AGENTROUTER_ACCOUNTS`，避免把旧 Cookie 账号和 OAuth profile 混在一起。
 
@@ -293,6 +339,8 @@ FEISHU_WEBHOOK=https://open.feishu.cn/open-apis/bot/v2/hook/replace-with-your-to
 ```text
 launchd/com.checkin.agentrouter.plist
 ```
+
+`launchd` 只启动签到脚本，不会自动启动 Clash、Mihomo 等代理程序。定时执行时必须保证 `CHECKIN_PROXY_URL` 对应的本地代理仍在运行，否则 GitHub OAuth 和 AgentRouter 请求会失败。
 
 先确认 `checkin-agentrouter` 短命令可以正常运行，然后安装任务：
 
