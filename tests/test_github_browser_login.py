@@ -10,6 +10,26 @@ from utils.config import AccountConfig, AppConfig, ProviderConfig
 from utils.profiles import is_profile_expired, read_profile_marker
 
 
+def test_oauth_callback_requires_closed_popup_or_provider_callback():
+	provider_page = SimpleNamespace(url='https://agentrouter.org/login')
+	github_login = SimpleNamespace(
+		url='https://github.com/login?return_to=%2Flogin%2Foauth%2Fauthorize',
+		is_closed=lambda: False,
+	)
+	closed_popup = SimpleNamespace(url='about:blank', is_closed=lambda: True)
+	provider_callback = SimpleNamespace(
+		url='https://agentrouter.org/api/oauth/github?code=code',
+		is_closed=lambda: False,
+	)
+
+	assert checkin._oauth_callback_completed(github_login, provider_page, 'https://agentrouter.org') is False
+	assert checkin._oauth_callback_completed(closed_popup, provider_page, 'https://agentrouter.org') is True
+	assert checkin._oauth_callback_completed(provider_callback, provider_page, 'https://agentrouter.org') is True
+	assert checkin._github_profile_requires_login(github_login) is True
+	assert checkin._github_profile_requires_login(closed_popup) is False
+	assert checkin._github_profile_requires_login(provider_callback) is False
+
+
 @pytest.mark.asyncio
 async def test_check_in_account_uses_github_browser_before_cookie_auth(monkeypatch):
 	account = AccountConfig(
@@ -93,6 +113,7 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 			self.url = 'about:blank'
 			self.init_scripts = []
 			self.wait_for_url_timeouts = []
+			self.closed = False
 
 		async def goto(self, url, **kwargs):
 			self.urls.append(url)
@@ -104,6 +125,9 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 
 		async def add_init_script(self, script):
 			self.init_scripts.append(script)
+
+		def is_closed(self):
+			return self.closed
 
 	context = FakeContext()
 	settings_seen = {}
@@ -151,6 +175,7 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 
 	async def fake_confirm_github_oauth(page, timeout_ms):
 		settings_seen['oauth_confirmation'] = (page, timeout_ms)
+		page.closed = True
 		return True
 
 	async def fake_wait_for_session_cookie(page, timeout_ms, *, cookie_url=None, previous_value=None):
@@ -159,7 +184,7 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 
 	async def fake_verify_browser_login(page, console_url, timeout_ms):
 		settings_seen['verify'] = (page, console_url, timeout_ms)
-		return {'id': 123456}
+		return None
 
 	monkeypatch.setattr(checkin, 'load_browser_login_settings', fake_load_browser_login_settings)
 	monkeypatch.setattr(checkin, 'launch_login_context', fake_launch_login_context)
@@ -170,6 +195,11 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 	monkeypatch.setattr(checkin, 'confirm_github_oauth', fake_confirm_github_oauth, raising=False)
 	monkeypatch.setattr(checkin, 'wait_for_session_cookie', fake_wait_for_session_cookie, raising=False)
 	monkeypatch.setattr(checkin, 'verify_browser_login', fake_verify_browser_login)
+	monkeypatch.setattr(
+		checkin,
+		'load_last_session',
+		lambda account_name: {'cookies': {'session': 'previous-session'}, 'api_user': '123456'},
+	)
 
 	provider = ProviderConfig(
 		name='agentrouter',
@@ -193,7 +223,7 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 	assert result == checkin.BrowserLoginResult(
 		cookies={'session': 'new-session', 'other': 'value'},
 		api_user='123456',
-		user_profile={'id': 123456},
+		user_profile=None,
 	)
 	assert settings_seen['args'] == ('profile_main', 'agentrouter', True, 'profile_main', False)
 	assert settings_seen['use_proxy'] is True
@@ -208,7 +238,7 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 	assert settings_seen['oauth_confirmation'][0] is context.pages[-1]
 	assert settings_seen['oauth_confirmation'][1] == 10_000
 	assert settings_seen['session_baseline'][1] == 'https://agentrouter.org'
-	assert settings_seen['session_wait'][1:] == (30_000, 'https://agentrouter.org', 'login-session')
+	assert settings_seen['session_wait'][1:] == (8_000, 'https://agentrouter.org', 'login-session')
 	assert settings_seen['verify'][1] == 'https://agentrouter.org/console'
 	assert context.closed is True
 	assert json.loads((tmp_path / 'existing-profile' / '.anyrouter-profile.json').read_text())['status'] == 'valid'

@@ -70,6 +70,9 @@ async def test_check_in_account_with_retries_stops_after_initial_attempt_and_max
 @pytest.mark.asyncio
 async def test_github_checkin_retries_reuse_one_previous_balance_query(monkeypatch):
 	class FakeGithubAccount(FakeAccount):
+		provider = 'agentrouter'
+		browser_profile = 'profile_main'
+
 		def uses_github_browser(self):
 			return True
 
@@ -104,3 +107,31 @@ async def test_github_checkin_retries_reuse_one_previous_balance_query(monkeypat
 	assert result == (True, before, after)
 	assert query_calls == [3]
 	assert checkin_calls == [(before, False, False)] * 5 + [(before, False, True)]
+
+
+@pytest.mark.asyncio
+async def test_github_checkin_stops_retrying_when_profile_requires_login(monkeypatch):
+	class FakeGithubAccount(FakeAccount):
+		provider = 'agentrouter'
+		browser_profile = 'profile_main'
+
+		def uses_github_browser(self):
+			return True
+
+	attempts = []
+
+	async def fake_query_previous_session_balance(account, account_index, app_config, *, max_attempts=3):
+		return None
+
+	async def fake_check_in_account(account, account_index, app_config, **kwargs):
+		attempts.append(account_index)
+		return False, None, None
+
+	monkeypatch.setattr(checkin, 'query_previous_session_balance', fake_query_previous_session_balance)
+	monkeypatch.setattr(checkin, 'check_in_account', fake_check_in_account)
+	monkeypatch.setattr(checkin, 'get_profile_status', lambda *args, **kwargs: 'expired')
+
+	result = await checkin.check_in_account_with_retries(FakeGithubAccount(), 0, object(), max_retries=5)
+
+	assert result == (False, None, None)
+	assert attempts == [0]

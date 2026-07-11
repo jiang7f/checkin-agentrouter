@@ -453,15 +453,6 @@ async def _read_stored_user_profile(page: Page) -> dict | None:
 	return _extract_user_profile(payload)
 
 
-def _profile_has_populated_quota(profile: dict) -> bool:
-	try:
-		quota = float(profile['quota'])
-		used_quota = float(profile['used_quota'])
-	except (KeyError, TypeError, ValueError):
-		return False
-	return quota != 0 or used_quota != 0
-
-
 async def is_logged_in(page: Page) -> bool:
 	"""快速判断：是否在 /console，或仍停留在登录页。"""
 	url = page.url.lower()
@@ -504,50 +495,40 @@ async def wait_for_logged_in(page: Page, timeout_ms: int = SESSION_WAIT_TIMEOUT_
 
 
 async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) -> dict | None:
-	"""跳转 /console，通过响应监听和主动查询确认登录用户。"""
+	"""跳转 /console，通过响应、localStorage 或主动查询确认登录用户。"""
 	captured_profile: dict | None = None
 
 	async def on_response(response) -> None:
 		nonlocal captured_profile
-		if captured_profile is not None and _profile_has_populated_quota(captured_profile):
+		if captured_profile is not None:
 			return
 		profile = await _parse_user_self_response(response)
 		if profile:
 			captured_profile = profile
 
 	page.on('response', on_response)
-	profile_fallback: dict | None = None
 	try:
 		print(f'[INFO] Verifying login via {console_url} and {USER_SELF_API_SUFFIX}')
 		await page.goto(console_url, wait_until='domcontentloaded', timeout=min(timeout_ms, 60_000))
 
-		for attempt in range(20):
+		for attempt in range(6):
 			if captured_profile is not None:
-				profile_fallback = captured_profile
-				if _profile_has_populated_quota(captured_profile):
-					break
-				captured_profile = None
+				break
 
 			stored_profile = await _read_stored_user_profile(page)
 			if stored_profile is not None:
-				profile_fallback = stored_profile
-				if _profile_has_populated_quota(stored_profile):
-					captured_profile = stored_profile
-					break
+				captured_profile = stored_profile
+				break
 
 			fetched_profile = await _fetch_user_profile(page)
 			if fetched_profile is not None:
-				profile_fallback = fetched_profile
-				if _profile_has_populated_quota(fetched_profile):
-					captured_profile = fetched_profile
-					break
+				captured_profile = fetched_profile
+				break
 
-			if attempt < 19:
+			if attempt < 5:
 				await asyncio.sleep(0.5)
 	finally:
 		page.remove_listener('response', on_response)
-	if captured_profile is None:
-		captured_profile = profile_fallback
 
 	if captured_profile:
 		if is_debug_enabled():

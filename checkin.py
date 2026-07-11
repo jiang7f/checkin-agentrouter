@@ -30,6 +30,9 @@ if hasattr(sys.stderr, 'reconfigure'):
 _real_stdout = sys.stdout
 _stdout_lock = threading.Lock()
 _current_log: contextvars.ContextVar = contextvars.ContextVar('checkin_current_log', default=None)
+_oauth_gate: contextvars.ContextVar[asyncio.Semaphore | None] = contextvars.ContextVar(
+	'checkin_oauth_gate', default=None
+)
 _PREFIX_COLORS = (36, 32, 33, 35, 34, 31)  # cyan / green / yellow / magenta / blue / red
 
 
@@ -681,6 +684,16 @@ async def login_with_credentials(
 		return None
 
 
+def _oauth_callback_completed(oauth_page, provider_page, provider_domain: str) -> bool:
+	if oauth_page is None:
+		return provider_domain in provider_page.url and '/login' not in provider_page.url
+	return oauth_page.is_closed() or (provider_domain in oauth_page.url and '/login' not in oauth_page.url)
+
+
+def _github_profile_requires_login(oauth_page) -> bool:
+	return oauth_page is not None and not oauth_page.is_closed() and oauth_page.url.startswith(GITHUB_LOGIN_URL)
+
+
 async def perform_github_browser_login(
 	account_name: str,
 	provider_config,
@@ -745,27 +758,45 @@ async def perform_github_browser_login(
 			initial_session_cookie = await get_session_cookie_value(page, cookie_url=provider_config.domain)
 			await page.goto(auth_url, wait_until='domcontentloaded', timeout=min(timeout_ms, 60_000))
 
-		if not await wait_for_session_cookie(
+		session_cookie_changed = await wait_for_session_cookie(
 			page,
-			min(timeout_ms, 30_000),
+			min(timeout_ms, 8_000),
 			cookie_url=provider_config.domain,
 			previous_value=initial_session_cookie,
-		):
+		)
+		if not session_cookie_changed:
 			print(f'[WARN] {account_name}: Provider session cookie was not observed before verification')
+		oauth_callback_completed = _oauth_callback_completed(oauth_page, page, provider_config.domain)
+		github_login_required = _github_profile_requires_login(oauth_page)
+		if github_login_required:
+			profile_name = settings.browser_profile or account_name
+			mark_profile_expired(provider_name, profile_name, profile_root=get_profile_root())
+			print(f'[FAILED] {account_name}: Saved GitHub profile requires login')
+			print(f'[HINT] Run: {CLI_COMMAND} add {profile_name}')
+			await save_login_screenshot(oauth_page, provider_name, account_name, 'github-profile-login-required')
+			await context.close()
+			return None
+		session_verified = session_cookie_changed and oauth_callback_completed
 
 		console_url = f'{provider_config.domain}/console'
 		user_profile = await verify_browser_login(page, console_url, timeout_ms)
-		if not user_profile:
+		if not user_profile and not session_verified:
 			print(f'[FAILED] {account_name}: GitHub browser login failed - /api/user/self not verified')
 			await save_login_screenshot(page, provider_name, account_name, 'github-browser-not-authenticated')
 			await context.close()
 			return None
+		if not user_profile:
+			print(f'[INFO] {account_name}: GitHub OAuth verified by completed callback and new session cookie')
 
 		cookies = await context.cookies()
 		all_cookies = {
 			cookie.get('name'): cookie.get('value') for cookie in cookies if cookie.get('name') and cookie.get('value')
 		}
-		api_user = str(user_profile['id']) if user_profile.get('id') is not None else None
+		if not all_cookies.get('session'):
+			print(f'[FAILED] {account_name}: GitHub browser login did not produce a provider session cookie')
+			await context.close()
+			return None
+		api_user = str(user_profile['id']) if user_profile and user_profile.get('id') is not None else None
 
 		print(f'[SUCCESS] {account_name}: GitHub browser login successful, got {len(all_cookies)} cookies')
 		await context.close()
@@ -926,8 +957,21 @@ async def login_with_github_browser(
 
 	result = await perform_github_browser_login(account_name, provider_config, provider_name, settings)
 	if not result:
-		print(f'[WARN] {account_name}: GitHub login attempt failed; profile status unchanged')
+		if get_profile_status(provider_name, profile_name, profile_root=get_profile_root()) == 'expired':
+			print(f'[WARN] {account_name}: GitHub profile is expired')
+		else:
+			print(f'[WARN] {account_name}: GitHub login attempt failed; profile status unchanged')
 		return None
+	if result.api_user is None:
+		previous_session = load_last_session(account_name)
+		previous_api_user = previous_session.get('api_user') if previous_session else None
+		if previous_api_user:
+			result = BrowserLoginResult(
+				cookies=result.cookies,
+				api_user=str(previous_api_user),
+				user_profile=result.user_profile,
+			)
+			print(f'[INFO] {account_name}: Reusing API user id from previous successful session')
 	mark_profile_dir_valid(settings.profile_dir)
 	return result
 
@@ -1308,6 +1352,13 @@ def get_checkin_concurrency() -> int:
 		return 3
 
 
+def get_oauth_concurrency() -> int:
+	try:
+		return max(int(os.getenv('CHECKIN_OAUTH_CONCURRENCY', '2')), 1)
+	except ValueError:
+		return 2
+
+
 async def query_previous_session_balance(
 	account: AccountConfig,
 	account_index: int,
@@ -1365,6 +1416,42 @@ async def query_previous_session_balance(
 	return None
 
 
+async def query_post_login_balance(
+	account: AccountConfig,
+	account_name: str,
+	provider_config,
+	login_result: BrowserLoginResult,
+	*,
+	max_attempts: int = 1,
+) -> dict | None:
+	"""OAuth 成功后快速查询余额，失败时不重新登录。"""
+	user_info = user_info_from_browser_profile(login_result.user_profile)
+	if user_info:
+		print(f'[INFO] {account_name}: Reusing user info verified in browser')
+		return user_info
+
+	max_attempts = max(max_attempts, 1)
+	for attempt in range(1, max_attempts + 1):
+		user_info = await asyncio.to_thread(
+			run_user_info_request,
+			login_result.cookies,
+			account,
+			account_name,
+			provider_config,
+			api_user_override=login_result.api_user,
+			use_proxy=provider_config.use_proxy,
+		)
+		if user_info and user_info.get('success'):
+			return user_info
+		error = user_info.get('error', 'Unknown error') if user_info else 'No response'
+		print(f'[WARN] {account_name}: Post-login balance query failed ({attempt}/{max_attempts}): {error}')
+		if attempt < max_attempts:
+			await asyncio.sleep(1)
+
+	print(f'[WARN] {account_name}: Check-in succeeded but post-login balance is unavailable')
+	return None
+
+
 async def check_in_account(
 	account: AccountConfig,
 	account_index: int,
@@ -1393,35 +1480,32 @@ async def check_in_account(
 		if query_previous_balance:
 			user_info_before = await query_previous_session_balance(account, account_index, app_config)
 
-		_set_account_step(2, 'GitHub OAuth 登录')
-		login_result = await login_with_github_browser(account, account_name, provider_config, account.provider)
+		oauth_gate = _oauth_gate.get()
+		if oauth_gate is None:
+			_set_account_step(2, 'GitHub OAuth 登录')
+			login_result = await login_with_github_browser(account, account_name, provider_config, account.provider)
+		else:
+			_set_account_step(2, '等待 OAuth 槽位')
+			async with oauth_gate:
+				_set_account_step(2, 'GitHub OAuth 登录')
+				login_result = await login_with_github_browser(account, account_name, provider_config, account.provider)
 		if login_result:
 			all_cookies = login_result.cookies
 			resolved_api_user = login_result.api_user
 			auth_method = 'github browser'
 			_set_account_step(3, '查询签到后余额')
-			user_info_after = user_info_from_browser_profile(login_result.user_profile)
-			if user_info_after:
-				print(f'[INFO] {account_name}: Reusing user info verified in browser')
-			else:
-				user_info_after = await asyncio.to_thread(
-					run_user_info_request,
-					all_cookies,
-					account,
-					account_name,
-					provider_config,
-					api_user_override=resolved_api_user,
-					use_proxy=provider_config.use_proxy,
-				)
+			user_info_after = await query_post_login_balance(
+				account,
+				account_name,
+				provider_config,
+				login_result,
+			)
 			if user_info_after and user_info_after.get('success'):
 				print(user_info_after.get('display', f':money: Current balance: ${user_info_after["quota"]}'))
-				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by GitHub OAuth login)')
-				_set_account_step(4, '保存状态')
-				save_last_session(account_name, all_cookies, resolved_api_user)
-				return True, user_info_before, user_info_after
-			error = user_info_after.get('error', 'Unknown error') if user_info_after else 'Unknown error'
-			print(f'[FAILED] {account_name}: Auto check-in failed - {error}')
-			return False, user_info_before, user_info_after
+			print(f'[INFO] {account_name}: Check-in completed automatically (triggered by GitHub OAuth login)')
+			_set_account_step(4, '保存状态')
+			save_last_session(account_name, all_cookies, resolved_api_user)
+			return True, user_info_before, user_info_after
 		else:
 			if expire_profile_on_login_failure:
 				profile_name = account.browser_profile or account_name
@@ -1513,6 +1597,12 @@ async def check_in_account_with_retries(
 		success, _, _ = last_result
 		if success:
 			return last_result
+		if is_github_browser:
+			profile_name = getattr(account, 'browser_profile', None) or account_name
+			provider_name = getattr(account, 'provider', DEFAULT_PROFILE_PROVIDER)
+			if get_profile_status(provider_name, profile_name, profile_root=get_profile_root()) == 'expired':
+				print(f'[FAILED] {account_name}: stopping retries because the GitHub profile requires login')
+				return last_result
 
 		if attempt < max_attempts:
 			print(f'[RETRY] {account_name}: attempt {attempt}/{max_attempts} failed')
@@ -1659,8 +1749,11 @@ async def main():
 	need_notify = False
 	balance_changed = False
 	concurrency = get_checkin_concurrency()
+	oauth_concurrency = min(get_oauth_concurrency(), concurrency)
 	print(f'[INFO] Account concurrency: {concurrency}')
+	print(f'[INFO] GitHub OAuth concurrency: {oauth_concurrency}')
 	semaphore = asyncio.Semaphore(concurrency)
+	oauth_semaphore = asyncio.Semaphore(oauth_concurrency)
 	parallel_output = concurrency > 1 and len(accounts) > 1
 	progress_output = _should_use_progress(concurrency, len(accounts))
 	prefix_width = max((len(account.get_display_name(index)) for index, account in enumerate(accounts)), default=0)
@@ -1700,6 +1793,7 @@ async def main():
 				_current_log.reset(token)
 
 	heartbeat_task = asyncio.create_task(_heartbeat(active_logs)) if parallel_output and not progress_output else None
+	oauth_gate_token = _oauth_gate.set(oauth_semaphore)
 	try:
 		account_tasks: list[asyncio.Task] = []
 		if progress_display is not None:
@@ -1734,6 +1828,8 @@ async def main():
 				include_success=is_debug_enabled(),
 			)
 		raise
+	finally:
+		_oauth_gate.reset(oauth_gate_token)
 
 	if progress_output:
 		_print_buffered_account_logs(account_logs, account_results, include_success=is_debug_enabled())

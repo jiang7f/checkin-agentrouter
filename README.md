@@ -99,12 +99,12 @@ checkin-agentrouter list
 
 ```text
 valid    GitHub profile 已验证
-expired  连续 6 次 GitHub OAuth 登录失败，可能需要重新 add
+expired  GitHub 已明确要求重新登录，或连续 6 次 OAuth 失败
 saved    本地 profile 目录存在
 configured  .env 中配置了这个名字
 ```
 
-单次 OAuth 或 AgentRouter 接口临时失败不会把 profile 标记为 `expired`。后续登录成功时，历史上的错误过期标记会自动恢复为 `valid`。
+单次 OAuth 或 AgentRouter 接口临时失败不会把 profile 标记为 `expired`。如果 OAuth 弹窗明确停在 GitHub 登录页，脚本会立即标记过期并停止无意义的重试。后续登录成功时，历史上的错误过期标记会自动恢复为 `valid`。
 
 如果同名 profile 仍是 `valid`，`add` 会询问是否覆盖。如果已经 `expired`，会直接覆盖。
 
@@ -120,9 +120,17 @@ checkin-agentrouter
 CHECKIN_CONCURRENCY=3
 ```
 
+GitHub OAuth 授权默认最多同时运行 2 个，避免同一 IP 在短时间内同时发起过多授权请求。余额查询和其他阶段仍按账号并发数执行：
+
+```bash
+CHECKIN_OAUTH_CONCURRENCY=2
+```
+
 手动在交互终端运行多个账号时，每个账号固定显示一行实时进度。等待并发槽位的账号不会提前计时，真正开始执行后才显示已用时间。成功账号保留最终余额，失败账号会在进度结束后展开详细日志。开启 `DEBUG_MODE` 时，成功账号的完整缓冲日志也会在进度结束后展开。
 
 `launchd`、重定向输出、单账号运行和并发数为 1 时继续输出普通逐行日志。单个账号失败时最多重试 5 次，最终通知只显示最后结果，不显示中间重试过程。
+
+GitHub OAuth 成功后会优先复用浏览器已返回的真实余额。如果浏览器只返回了零值占位数据，脚本仅用新 session cookie 快速直查一次。余额查询失败不会重新执行 OAuth，本次通知会显示“余额获取失败”，新 session 仍会保存给下次签到前查询使用。
 
 ## 飞书通知
 

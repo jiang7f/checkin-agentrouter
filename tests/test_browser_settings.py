@@ -142,12 +142,9 @@ def test_browser_login_settings_can_reset_named_profile(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_verify_browser_login_actively_retries_user_info(monkeypatch):
-	profile = {'id': 123456, 'quota': 12_625_000, 'used_quota': 112_375_000}
-	payloads = [
-		{'success': True, 'data': {'id': 123456, 'quota': 0, 'used_quota': 0}},
-		{'success': True, 'data': profile},
-	]
+async def test_verify_browser_login_accepts_identity_without_waiting_for_balance(monkeypatch):
+	profile = {'id': 123456, 'quota': 0, 'used_quota': 0}
+	payloads = [{'success': True, 'data': profile}]
 	sleeps = []
 
 	class FakePage:
@@ -183,9 +180,9 @@ async def test_verify_browser_login_actively_retries_user_info(monkeypatch):
 	result = await verify_browser_login(page, 'https://agentrouter.org/console', 60_000)
 
 	assert result == profile
-	assert page.evaluations == ['/api/user/self', '/api/user/self']
+	assert page.evaluations == ['/api/user/self']
 	assert page.load_states == []
-	assert sleeps == [0.5]
+	assert sleeps == []
 
 
 @pytest.mark.asyncio
@@ -216,10 +213,9 @@ async def test_verify_browser_login_uses_current_local_storage_user():
 
 
 @pytest.mark.asyncio
-async def test_verify_browser_login_waits_for_storage_quota_to_populate(monkeypatch):
+async def test_verify_browser_login_accepts_zero_balance_storage_identity_immediately(monkeypatch):
 	placeholder = {'id': 123456, 'quota': 0, 'used_quota': 0}
-	profile = {'id': 123456, 'quota': 12_625_000, 'used_quota': 112_375_000}
-	stored_profiles = [placeholder, profile]
+	stored_profiles = [placeholder]
 	sleeps = []
 
 	class FakePage:
@@ -247,8 +243,8 @@ async def test_verify_browser_login_waits_for_storage_quota_to_populate(monkeypa
 
 	result = await verify_browser_login(FakePage(), 'https://agentrouter.org/console', 60_000)
 
-	assert result == profile
-	assert sleeps == [0.5]
+	assert result == placeholder
+	assert sleeps == []
 
 
 @pytest.mark.asyncio

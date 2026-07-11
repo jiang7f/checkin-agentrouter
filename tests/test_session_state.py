@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import pytest
@@ -218,6 +219,108 @@ def test_browser_user_profile_rejects_zero_quota_placeholder():
 	)
 
 	assert result is None
+
+
+@pytest.mark.asyncio
+async def test_github_browser_checkin_does_not_repeat_oauth_when_post_balance_is_unavailable(monkeypatch):
+	account = AccountConfig(
+		name='profile_main',
+		provider='agentrouter',
+		cookies=None,
+		api_user=None,
+		github_browser=True,
+		browser_profile='profile_main',
+	)
+	provider = ProviderConfig(name='agentrouter', domain='https://agentrouter.org', sign_in_path=None)
+	app_config = AppConfig(providers={'agentrouter': provider})
+	calls = {'login': 0, 'prepare': 0, 'user_info': 0}
+	saved = {}
+	sleeps = []
+
+	async def fake_login_with_github_browser(account_arg, account_name, provider_config, provider_name):
+		calls['login'] += 1
+		return checkin.BrowserLoginResult(
+			cookies={'session': 'new-session'},
+			api_user='new-user',
+			user_profile={'id': 123456, 'quota': 0, 'used_quota': 0},
+		)
+
+	def fake_run_user_info_request(*args, **kwargs):
+		calls['user_info'] += 1
+		return {'success': False, 'error': 'non-json response'}
+
+	async def fake_prepare_cookies(account_name, provider_config, cookies):
+		calls['prepare'] += 1
+		return {**cookies, 'acw_tc': f'waf-{calls["prepare"]}'}
+
+	async def fake_sleep(delay):
+		sleeps.append(delay)
+
+	monkeypatch.setattr(checkin, 'login_with_github_browser', fake_login_with_github_browser)
+	monkeypatch.setattr(checkin, 'prepare_cookies', fake_prepare_cookies)
+	monkeypatch.setattr(checkin, 'run_user_info_request', fake_run_user_info_request)
+	monkeypatch.setattr(checkin.asyncio, 'sleep', fake_sleep)
+	monkeypatch.setattr(
+		checkin,
+		'save_last_session',
+		lambda account_name, cookies, api_user: saved.update(
+			{'account_name': account_name, 'cookies': cookies, 'api_user': api_user}
+		),
+	)
+
+	result = await checkin.check_in_account_with_retries(account, 0, app_config)
+
+	assert result == (True, None, None)
+	assert calls == {'login': 1, 'prepare': 0, 'user_info': 1}
+	assert sleeps == []
+	assert saved == {'account_name': 'profile_main', 'cookies': {'session': 'new-session'}, 'api_user': 'new-user'}
+
+
+@pytest.mark.asyncio
+async def test_github_oauth_gate_limits_only_login_phase_to_two(monkeypatch):
+	provider = ProviderConfig(name='agentrouter', domain='https://agentrouter.org', sign_in_path=None)
+	app_config = AppConfig(providers={'agentrouter': provider})
+	accounts = [
+		AccountConfig(
+			name=f'profile_{index}',
+			provider='agentrouter',
+			cookies=None,
+			api_user=None,
+			github_browser=True,
+			browser_profile=f'profile_{index}',
+		)
+		for index in range(3)
+	]
+	active = 0
+	max_active = 0
+
+	async def fake_login_with_github_browser(account, account_name, provider_config, provider_name):
+		nonlocal active, max_active
+		active += 1
+		max_active = max(max_active, active)
+		await asyncio.sleep(0.01)
+		active -= 1
+		return checkin.BrowserLoginResult(
+			cookies={'session': f'session-{account_name}'},
+			api_user=account_name,
+			user_profile={'id': account_name, 'quota': 500_000, 'used_quota': 0},
+		)
+
+	monkeypatch.setattr(checkin, 'login_with_github_browser', fake_login_with_github_browser)
+	monkeypatch.setattr(checkin, 'save_last_session', lambda *args: None)
+	token = checkin._oauth_gate.set(asyncio.Semaphore(2))
+	try:
+		results = await asyncio.gather(
+			*(
+				checkin.check_in_account(account, index, app_config, query_previous_balance=False)
+				for index, account in enumerate(accounts)
+			)
+		)
+	finally:
+		checkin._oauth_gate.reset(token)
+
+	assert max_active == 2
+	assert all(result[0] for result in results)
 
 
 @pytest.mark.asyncio
