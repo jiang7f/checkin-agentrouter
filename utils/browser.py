@@ -155,6 +155,7 @@ _OPEN_EMAIL_FORM_JS = """() => {
 class BrowserLoginResult:
 	cookies: dict[str, str]
 	api_user: str | None = None
+	user_profile: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -416,6 +417,29 @@ async def _parse_user_self_response(response) -> dict | None:
 	return _extract_user_profile(payload)
 
 
+async def _fetch_user_profile(page: Page) -> dict | None:
+	try:
+		payload = await page.evaluate(
+			"""async path => {
+				try {
+					const response = await fetch(path, {
+						cache: 'no-store',
+						credentials: 'include',
+						headers: { Accept: 'application/json' },
+					});
+					if (!response.ok) return null;
+					return await response.json();
+				} catch {
+					return null;
+				}
+			}""",
+			USER_SELF_API_SUFFIX,
+		)
+	except Exception:  # nosec B110
+		return None
+	return _extract_user_profile(payload)
+
+
 async def is_logged_in(page: Page) -> bool:
 	"""快速判断：是否在 /console，或仍停留在登录页。"""
 	url = page.url.lower()
@@ -451,10 +475,8 @@ async def wait_for_logged_in(page: Page, timeout_ms: int = SESSION_WAIT_TIMEOUT_
 
 
 async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) -> dict | None:
-	"""跳转 /console 并拦截 /api/user/self，用浏览器会话确认登录用户。"""
-	verify_timeout = min(timeout_ms, SESSION_WAIT_TIMEOUT_MS)
+	"""跳转 /console，通过响应监听和主动查询确认登录用户。"""
 	captured_profile: dict | None = None
-	verified = asyncio.Event()
 
 	async def on_response(response) -> None:
 		nonlocal captured_profile
@@ -463,7 +485,6 @@ async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) ->
 		profile = await _parse_user_self_response(response)
 		if profile:
 			captured_profile = profile
-			verified.set()
 
 	page.on('response', on_response)
 	try:
@@ -475,10 +496,12 @@ async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) ->
 			pass
 
 		if captured_profile is None:
-			try:
-				await asyncio.wait_for(verified.wait(), timeout=verify_timeout / 1000)
-			except TimeoutError:
-				pass
+			for attempt in range(3):
+				captured_profile = await _fetch_user_profile(page)
+				if captured_profile is not None:
+					break
+				if attempt < 2:
+					await asyncio.sleep(1)
 	finally:
 		page.remove_listener('response', on_response)
 

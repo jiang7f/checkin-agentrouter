@@ -724,7 +724,7 @@ async def perform_github_browser_login(
 		try:
 			await page.wait_for_url(
 				lambda url: provider_config.domain in url and '/login' not in url,
-				timeout=min(timeout_ms, 120_000),
+				timeout=min(timeout_ms, 30_000),
 			)
 		except Exception:  # nosec B110
 			pass
@@ -746,7 +746,7 @@ async def perform_github_browser_login(
 
 		print(f'[SUCCESS] {account_name}: GitHub browser login successful, got {len(all_cookies)} cookies')
 		await context.close()
-		return BrowserLoginResult(cookies=all_cookies, api_user=api_user)
+		return BrowserLoginResult(cookies=all_cookies, api_user=api_user, user_profile=user_profile)
 
 	except Exception as e:
 		print(f'[FAILED] {account_name}: Error during GitHub browser login: {e}')
@@ -1075,6 +1075,22 @@ def get_user_info(client, headers, user_info_url: str):
 		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
 
 
+def user_info_from_browser_profile(user_profile: dict | None) -> dict | None:
+	if not isinstance(user_profile, dict):
+		return None
+	try:
+		quota = round(float(user_profile['quota']) / 500000, 2)
+		used_quota = round(float(user_profile['used_quota']) / 500000, 2)
+	except (KeyError, TypeError, ValueError):
+		return None
+	return {
+		'success': True,
+		'quota': quota,
+		'used_quota': used_quota,
+		'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+	}
+
+
 def make_request_headers(provider_config, account: AccountConfig, api_user_override: str | None = None) -> dict:
 	headers = {
 		'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
@@ -1359,15 +1375,19 @@ async def check_in_account(
 			resolved_api_user = login_result.api_user
 			auth_method = 'github browser'
 			_set_account_step(3, '查询签到后余额')
-			user_info_after = await asyncio.to_thread(
-				run_user_info_request,
-				all_cookies,
-				account,
-				account_name,
-				provider_config,
-				api_user_override=resolved_api_user,
-				use_proxy=provider_config.use_proxy,
-			)
+			user_info_after = user_info_from_browser_profile(login_result.user_profile)
+			if user_info_after:
+				print(f'[INFO] {account_name}: Reusing user info verified in browser')
+			else:
+				user_info_after = await asyncio.to_thread(
+					run_user_info_request,
+					all_cookies,
+					account,
+					account_name,
+					provider_config,
+					api_user_override=resolved_api_user,
+					use_proxy=provider_config.use_proxy,
+				)
 			if user_info_after and user_info_after.get('success'):
 				print(user_info_after.get('display', f':money: Current balance: ${user_info_after["quota"]}'))
 				print(f'[INFO] {account_name}: Check-in completed automatically (triggered by GitHub OAuth login)')

@@ -155,6 +155,60 @@ async def test_github_browser_checkin_uses_previous_session_for_before_balance(m
 
 
 @pytest.mark.asyncio
+async def test_github_browser_checkin_reuses_browser_user_profile(monkeypatch):
+	account = AccountConfig(
+		name='profile_main',
+		provider='agentrouter',
+		cookies=None,
+		api_user=None,
+		github_browser=True,
+		browser_profile='profile_main',
+	)
+	provider = ProviderConfig(name='agentrouter', domain='https://agentrouter.org', sign_in_path=None)
+	app_config = AppConfig(providers={'agentrouter': provider})
+	saved = {}
+
+	async def fake_login_with_github_browser(account_arg, account_name, provider_config, provider_name):
+		return checkin.BrowserLoginResult(
+			cookies={'session': 'new-session'},
+			api_user='new-user',
+			user_profile={
+				'id': 123456,
+				'quota': 12_625_000,
+				'used_quota': 112_375_000,
+			},
+		)
+
+	def fail_duplicate_user_info_request(*args, **kwargs):
+		raise AssertionError('browser user profile should avoid duplicate HTTP request')
+
+	monkeypatch.setattr(checkin, 'load_last_session', lambda account_name: None)
+	monkeypatch.setattr(checkin, 'login_with_github_browser', fake_login_with_github_browser)
+	monkeypatch.setattr(checkin, 'run_user_info_request', fail_duplicate_user_info_request)
+	monkeypatch.setattr(
+		checkin,
+		'save_last_session',
+		lambda account_name, cookies, api_user: saved.update(
+			{'account_name': account_name, 'cookies': cookies, 'api_user': api_user}
+		),
+	)
+
+	result = await checkin.check_in_account(account, 0, app_config)
+
+	assert result == (
+		True,
+		None,
+		{
+			'success': True,
+			'quota': 25.25,
+			'used_quota': 224.75,
+			'display': ':money: Current balance: $25.25, Used: $224.75',
+		},
+	)
+	assert saved == {'account_name': 'profile_main', 'cookies': {'session': 'new-session'}, 'api_user': 'new-user'}
+
+
+@pytest.mark.asyncio
 async def test_previous_session_balance_retries_three_times_before_checkin(monkeypatch):
 	account = AccountConfig(
 		name='profile_main',

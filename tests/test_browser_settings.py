@@ -3,7 +3,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from utils.browser import launch_login_context, load_browser_login_settings
+import utils.browser as browser_module
+from utils.browser import launch_login_context, load_browser_login_settings, verify_browser_login
 
 
 def test_browser_login_settings_records_profile_persistence(monkeypatch, tmp_path):
@@ -132,3 +133,43 @@ def test_browser_login_settings_can_reset_named_profile(monkeypatch, tmp_path):
 
 	assert settings.profile_dir == profile_dir
 	assert not profile_dir.exists()
+
+
+@pytest.mark.asyncio
+async def test_verify_browser_login_actively_retries_user_info(monkeypatch):
+	profile = {'id': 123456, 'quota': 12_625_000, 'used_quota': 112_375_000}
+	payloads = [None, {'success': True, 'data': profile}]
+	sleeps = []
+
+	class FakePage:
+		def __init__(self):
+			self.url = 'about:blank'
+			self.evaluations = []
+
+		def on(self, event, callback):
+			pass
+
+		def remove_listener(self, event, callback):
+			pass
+
+		async def goto(self, url, **kwargs):
+			self.url = url
+
+		async def wait_for_load_state(self, state, timeout):
+			pass
+
+		async def evaluate(self, expression, arg):
+			self.evaluations.append(arg)
+			return payloads.pop(0)
+
+	async def fake_sleep(delay):
+		sleeps.append(delay)
+
+	page = FakePage()
+	monkeypatch.setattr(browser_module.asyncio, 'sleep', fake_sleep)
+
+	result = await verify_browser_login(page, 'https://agentrouter.org/console', 60_000)
+
+	assert result == profile
+	assert page.evaluations == ['/api/user/self', '/api/user/self']
+	assert sleeps == [1]

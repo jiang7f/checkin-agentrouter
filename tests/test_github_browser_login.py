@@ -175,7 +175,11 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 	)
 	result = await checkin.login_with_github_browser(account, 'profile_main', provider, 'agentrouter')
 
-	assert result == checkin.BrowserLoginResult(cookies={'session': 'new-session', 'other': 'value'}, api_user='123456')
+	assert result == checkin.BrowserLoginResult(
+		cookies={'session': 'new-session', 'other': 'value'},
+		api_user='123456',
+		user_profile={'id': 123456},
+	)
 	assert settings_seen['args'] == ('profile_main', 'agentrouter', True, 'profile_main', False)
 	assert settings_seen['use_proxy'] is True
 	assert 'agentrouter.org' in context.cleared_domains
@@ -215,12 +219,14 @@ async def test_github_browser_login_falls_back_to_auth_url_when_click_stays_on_l
 			self.context = context
 			self.url = 'about:blank'
 			self.urls = []
+			self.wait_for_url_timeouts = []
 
 		async def goto(self, url, **kwargs):
 			self.urls.append(url)
 			self.url = url
 
 		async def wait_for_url(self, *args, **kwargs):
+			self.wait_for_url_timeouts.append(kwargs['timeout'])
 			return None
 
 		async def evaluate(self, script):
@@ -271,11 +277,16 @@ async def test_github_browser_login_falls_back_to_auth_url_when_click_stays_on_l
 
 	result = await checkin.perform_github_browser_login('profile_main', provider, 'agentrouter', settings)
 
-	assert result == checkin.BrowserLoginResult(cookies={'session': 'new-session'}, api_user='123456')
+	assert result == checkin.BrowserLoginResult(
+		cookies={'session': 'new-session'},
+		api_user='123456',
+		user_profile={'id': 123456},
+	)
 	assert (
 		'https://github.com/login/oauth/authorize?client_id=github-client-id&state=oauth-state&scope=user%3Aemail'
 		in context.page.urls
 	)
+	assert context.page.wait_for_url_timeouts == [8_000, 30_000]
 	assert calls['session_waits'] == 1
 	assert context.closed is True
 
