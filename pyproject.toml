@@ -1,7 +1,8 @@
 [project]
 name = "checkin-agentrouter"
 version = "0.1.0"
-description = "Local AgentRouter daily check-in automation"
+description = "AgentRouter 自动签到工具，支持多账号 GitHub OAuth、余额查询和飞书通知"
+keywords = ["agentrouter", "checkin", "daily-checkin", "automation", "github-oauth"]
 requires-python = ">=3.11"
 dependencies = [
   "httpx[http2]>=0.24.0",

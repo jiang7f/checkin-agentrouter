@@ -1,6 +1,8 @@
-# checkin-agentrouter
+# AgentRouter 自动签到（checkin-agentrouter）
 
-本地运行的 AgentRouter 多账号每日签到工具。项目为每个账号保存独立的 GitHub 浏览器 profile，每次执行时保留 GitHub 登录态、清除 AgentRouter 登录态，再重新完成 GitHub OAuth。AgentRouter 的每日签到由这次重新登录触发。
+AgentRouter 自动签到脚本，支持本地多账号每日签到、GitHub OAuth、签到前后余额查询、实时进度条和飞书通知。项目为每个账号保存独立的 GitHub 浏览器 profile，每次执行时保留 GitHub 登录态、清除 AgentRouter 登录态，再重新完成 GitHub OAuth。AgentRouter 的每日签到由这次重新登录触发。
+
+English summary: Local AgentRouter daily check-in automation with multi-account GitHub OAuth, balance tracking, Rich progress and Feishu notifications.
 
 本项目不会把“使用旧 Cookie 成功读取余额”当作签到成功。旧 Session 只用于读取签到前余额，真正签到始终由新的 GitHub OAuth 完成。
 
