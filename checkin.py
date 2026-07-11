@@ -57,7 +57,7 @@ class _AccountLog:
 		self.prefix = prefix
 		self.partial = ''
 		self.last_line = ''
-		self.start = time.monotonic()
+		self.start: float | None = None
 		self.lines: list[str] = []
 		self.emit_lines = emit_lines
 		self.task_id: TaskID | None = None
@@ -130,6 +130,7 @@ class _AccountProgressDisplay:
 				completed=0,
 				attempt='',
 				message='等待',
+				start=False,
 			)
 			log.display = self
 
@@ -159,6 +160,14 @@ class _AccountProgressDisplay:
 
 	def refresh(self) -> None:
 		self.progress.refresh()
+
+	def start_account(self, log: _AccountLog) -> None:
+		if log.task_id is None:
+			raise RuntimeError(f'Progress task is not initialized for {log.name}')
+		if log.start is not None:
+			return
+		log.start = time.monotonic()
+		self.progress.start_task(log.task_id)
 
 	def update(self, log: _AccountLog, *, step: int, message: str, attempt: int, max_attempts: int) -> None:
 		if log.task_id is None:
@@ -247,7 +256,7 @@ async def _heartbeat(active_logs: dict, interval: float = 5.0) -> None:
 			with _stdout_lock:
 				parts = []
 				for log in active_logs.values():
-					elapsed = int(time.monotonic() - log.start)
+					elapsed = int(time.monotonic() - log.start) if log.start is not None else 0
 					step = log.last_line[:48] if log.last_line else 'working'
 					parts.append(f'{log.name} {elapsed}s（{step}）')
 				if parts:
@@ -309,6 +318,8 @@ load_dotenv()
 from utils.browser import (
 	BrowserLoginResult,
 	click_github_login_entry,
+	confirm_github_oauth,
+	get_session_cookie_value,
 	has_session_cookie,
 	is_logged_in,
 	launch_login_context,
@@ -700,35 +711,47 @@ async def perform_github_browser_login(
 			provider=provider_name,
 			account_name=account_name,
 		)
+		initial_session_cookie = await get_session_cookie_value(page, cookie_url=provider_config.domain)
+		pages_before_oauth = tuple(context.pages)
 		clicked_github = await click_github_login_entry(
 			page,
 			min(timeout_ms, 30_000),
 			provider=provider_name,
 			account_name=account_name,
 		)
-		try:
-			await page.wait_for_url(
-				lambda url: provider_config.domain in url and '/login' not in url,
-				timeout=8_000,
-			)
-		except Exception:  # nosec B110
-			pass
+		oauth_page = next((candidate for candidate in context.pages if candidate not in pages_before_oauth), None)
+		if clicked_github and oauth_page is None:
+			try:
+				await page.wait_for_url(
+					lambda url: not (provider_config.domain in str(url) and '/login' in str(url)),
+					timeout=min(timeout_ms, 3_000),
+				)
+			except Exception:  # nosec B110
+				pass
+			oauth_page = next((candidate for candidate in context.pages if candidate not in pages_before_oauth), None)
+		if oauth_page is not None:
+			print(f'[INFO] {account_name}: GitHub OAuth opened in a new browser page')
+			post_state_session_cookie = await get_session_cookie_value(page, cookie_url=provider_config.domain)
+			if await confirm_github_oauth(oauth_page, min(timeout_ms, 10_000)):
+				initial_session_cookie = post_state_session_cookie
+				print(f'[INFO] {account_name}: Confirmed GitHub OAuth authorization')
 
-		if not clicked_github or '/login' in page.url:
+		still_on_provider_login = provider_config.domain in page.url and '/login' in page.url
+		if not clicked_github or (oauth_page is None and still_on_provider_login):
 			auth_url = await build_github_oauth_authorize_url(page, account_name)
 			if not auth_url:
 				auth_url = f'{provider_config.domain}{provider_config.github_auth_path}'
 			print(f'[WARN] {account_name}: GitHub OAuth was not triggered from login page, falling back to {auth_url}')
+			initial_session_cookie = await get_session_cookie_value(page, cookie_url=provider_config.domain)
 			await page.goto(auth_url, wait_until='domcontentloaded', timeout=min(timeout_ms, 60_000))
 
-		try:
-			await page.wait_for_url(
-				lambda url: provider_config.domain in url and '/login' not in url,
-				timeout=min(timeout_ms, 30_000),
-			)
-		except Exception:  # nosec B110
-			pass
-		await wait_for_session_cookie(page, min(timeout_ms, 120_000))
+		if not await wait_for_session_cookie(
+			page,
+			min(timeout_ms, 30_000),
+			cookie_url=provider_config.domain,
+			previous_value=initial_session_cookie,
+		):
+			print(f'[WARN] {account_name}: Provider session cookie was not observed before verification')
 
 		console_url = f'{provider_config.domain}/console'
 		user_profile = await verify_browser_login(page, console_url, timeout_ms)
@@ -1082,6 +1105,8 @@ def user_info_from_browser_profile(user_profile: dict | None) -> dict | None:
 		quota = round(float(user_profile['quota']) / 500000, 2)
 		used_quota = round(float(user_profile['used_quota']) / 500000, 2)
 	except (KeyError, TypeError, ValueError):
+		return None
+	if quota == 0 and used_quota == 0:
 		return None
 	return {
 		'success': True,
@@ -1655,6 +1680,10 @@ async def main():
 			if not parallel_output:
 				return await process_account_for_main(account, index, app_config)
 			log = account_logs[index]
+			if progress_display is not None:
+				progress_display.start_account(log)
+			else:
+				log.start = time.monotonic()
 			token = _current_log.set(log)
 			active_logs[index] = log
 			try:

@@ -70,6 +70,7 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 			]
 			self.closed = False
 			self.page = FakePage(self)
+			self.pages = [self.page]
 
 		async def new_page(self):
 			return self.page
@@ -91,14 +92,15 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 			self.urls = []
 			self.url = 'about:blank'
 			self.init_scripts = []
+			self.wait_for_url_timeouts = []
 
 		async def goto(self, url, **kwargs):
 			self.urls.append(url)
 			self.url = url
 
 		async def wait_for_url(self, *args, **kwargs):
-			self.wait_for_url_args = (args, kwargs)
-			self.url = 'https://agentrouter.org/console'
+			self.wait_for_url_timeouts.append(kwargs['timeout'])
+			raise TimeoutError
 
 		async def add_init_script(self, script):
 			self.init_scripts.append(script)
@@ -138,10 +140,21 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 
 	async def fake_click_github_login_entry(page, timeout_ms, *, provider, account_name):
 		settings_seen['github_click'] = (page, timeout_ms, provider, account_name)
+		popup = FakePage(context)
+		popup.url = 'https://github.com/login/oauth/authorize'
+		context.pages.append(popup)
 		return True
 
-	async def fake_wait_for_session_cookie(page, timeout_ms):
-		settings_seen['session_wait'] = (page, timeout_ms)
+	async def fake_get_session_cookie_value(page, *, cookie_url=None):
+		settings_seen['session_baseline'] = (page, cookie_url)
+		return 'login-session'
+
+	async def fake_confirm_github_oauth(page, timeout_ms):
+		settings_seen['oauth_confirmation'] = (page, timeout_ms)
+		return True
+
+	async def fake_wait_for_session_cookie(page, timeout_ms, *, cookie_url=None, previous_value=None):
+		settings_seen['session_wait'] = (page, timeout_ms, cookie_url, previous_value)
 		return True
 
 	async def fake_verify_browser_login(page, console_url, timeout_ms):
@@ -153,7 +166,9 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 	monkeypatch.setattr(checkin, 'prepare_browser_page', fake_prepare_browser_page)
 	monkeypatch.setattr(checkin, 'navigate_login_page', fake_navigate_login_page)
 	monkeypatch.setattr(checkin, 'click_github_login_entry', fake_click_github_login_entry)
-	monkeypatch.setattr(checkin, 'wait_for_session_cookie', fake_wait_for_session_cookie)
+	monkeypatch.setattr(checkin, 'get_session_cookie_value', fake_get_session_cookie_value, raising=False)
+	monkeypatch.setattr(checkin, 'confirm_github_oauth', fake_confirm_github_oauth, raising=False)
+	monkeypatch.setattr(checkin, 'wait_for_session_cookie', fake_wait_for_session_cookie, raising=False)
 	monkeypatch.setattr(checkin, 'verify_browser_login', fake_verify_browser_login)
 
 	provider = ProviderConfig(
@@ -189,7 +204,11 @@ async def test_login_with_github_browser_uses_persistent_profile_and_oauth(monke
 	assert context.page.urls == ['https://agentrouter.org/login']
 	assert settings_seen['navigate'][1] == 'https://agentrouter.org/login'
 	assert settings_seen['github_click'][2:] == ('agentrouter', 'profile_main')
-	assert settings_seen['session_wait'][1] == 60_000
+	assert context.page.wait_for_url_timeouts == []
+	assert settings_seen['oauth_confirmation'][0] is context.pages[-1]
+	assert settings_seen['oauth_confirmation'][1] == 10_000
+	assert settings_seen['session_baseline'][1] == 'https://agentrouter.org'
+	assert settings_seen['session_wait'][1:] == (30_000, 'https://agentrouter.org', 'login-session')
 	assert settings_seen['verify'][1] == 'https://agentrouter.org/console'
 	assert context.closed is True
 	assert json.loads((tmp_path / 'existing-profile' / '.anyrouter-profile.json').read_text())['status'] == 'valid'
@@ -201,6 +220,7 @@ async def test_github_browser_login_falls_back_to_auth_url_when_click_stays_on_l
 		def __init__(self):
 			self.closed = False
 			self.page = FakePage(self)
+			self.pages = [self.page]
 
 		async def new_page(self):
 			return self.page
@@ -227,13 +247,16 @@ async def test_github_browser_login_falls_back_to_auth_url_when_click_stays_on_l
 
 		async def wait_for_url(self, *args, **kwargs):
 			self.wait_for_url_timeouts.append(kwargs['timeout'])
-			return None
+			if kwargs['timeout'] == 3_000:
+				raise TimeoutError
+			self.url = 'https://agentrouter.org/console'
 
 		async def evaluate(self, script):
 			return {'clientId': 'github-client-id', 'state': 'oauth-state'}
 
 	context = FakeContext()
-	calls = {'session_waits': 0}
+	baselines = iter(('login-session', 'oauth-state-session'))
+	calls = {}
 
 	async def fake_launch_login_context(settings, *, use_proxy):
 		return context
@@ -247,8 +270,11 @@ async def test_github_browser_login_falls_back_to_auth_url_when_click_stays_on_l
 	async def fake_click_github_login_entry(page, timeout_ms, *, provider, account_name):
 		return True
 
-	async def fake_wait_for_session_cookie(page, timeout_ms):
-		calls['session_waits'] += 1
+	async def fake_get_session_cookie_value(page, *, cookie_url=None):
+		return next(baselines)
+
+	async def fake_wait_for_session_cookie(page, timeout_ms, *, cookie_url=None, previous_value=None):
+		calls['previous_value'] = previous_value
 		return True
 
 	async def fake_verify_browser_login(page, console_url, timeout_ms):
@@ -258,7 +284,8 @@ async def test_github_browser_login_falls_back_to_auth_url_when_click_stays_on_l
 	monkeypatch.setattr(checkin, 'prepare_browser_page', fake_prepare_browser_page)
 	monkeypatch.setattr(checkin, 'navigate_login_page', fake_navigate_login_page)
 	monkeypatch.setattr(checkin, 'click_github_login_entry', fake_click_github_login_entry)
-	monkeypatch.setattr(checkin, 'wait_for_session_cookie', fake_wait_for_session_cookie)
+	monkeypatch.setattr(checkin, 'get_session_cookie_value', fake_get_session_cookie_value, raising=False)
+	monkeypatch.setattr(checkin, 'wait_for_session_cookie', fake_wait_for_session_cookie, raising=False)
 	monkeypatch.setattr(checkin, 'verify_browser_login', fake_verify_browser_login)
 	settings = BrowserLoginSettings(
 		headless=True,
@@ -286,8 +313,8 @@ async def test_github_browser_login_falls_back_to_auth_url_when_click_stays_on_l
 		'https://github.com/login/oauth/authorize?client_id=github-client-id&state=oauth-state&scope=user%3Aemail'
 		in context.page.urls
 	)
-	assert context.page.wait_for_url_timeouts == [8_000, 30_000]
-	assert calls['session_waits'] == 1
+	assert context.page.wait_for_url_timeouts == [3_000]
+	assert calls['previous_value'] == 'oauth-state-session'
 	assert context.closed is True
 
 

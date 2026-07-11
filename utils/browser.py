@@ -328,11 +328,6 @@ async def _wait_for_optional_load_state(page: Page, state: str, timeout_ms: int)
 		return False
 
 
-async def _settle_page(page: Page, delay_seconds: float, networkidle_timeout_ms: int) -> None:
-	await asyncio.sleep(delay_seconds)
-	await _wait_for_optional_load_state(page, 'networkidle', networkidle_timeout_ms)
-
-
 async def _wait_for_login_shell(page: Page, timeout_ms: int) -> bool:
 	shell_timeout = min(timeout_ms, 60_000)
 	try:
@@ -350,50 +345,51 @@ async def navigate_login_page(
 	provider: str = '',
 	account_name: str = '',
 ) -> None:
-	"""预热站点、导航登录页并等待 SPA 渲染完成。"""
+	"""导航登录页并按页面条件等待 SPA 渲染，失败时再预热站点重试。"""
 	from urllib.parse import urlparse
 
 	parsed = urlparse(login_url)
 	base_url = f'{parsed.scheme}://{parsed.netloc}/'
 	attempt_timeout = min(timeout_ms, 60_000)
 
-	try:
-		print(f'[INFO] Warming up {base_url} before login')
-		await page.goto(base_url, wait_until='load', timeout=attempt_timeout)
-		await _settle_page(page, 3, 15_000)
-		closed = await dismiss_popups(page)
-		if closed:
-			print(f'[INFO] Dismissed {closed} popup dialog(s) during warmup')
-	except Exception as exc:
-		print(f'[WARN] Warmup navigation failed: {exc}')
-
 	for attempt in range(3):
 		print(f'[INFO] Navigating login page (attempt {attempt + 1}/3): {login_url}')
-		await page.goto(login_url, wait_until='load', timeout=attempt_timeout)
-		await _settle_page(page, 5, 20_000)
+		await page.goto(login_url, wait_until='domcontentloaded', timeout=attempt_timeout)
 
-		if await _wait_for_login_shell(page, attempt_timeout):
-			await wait_for_site_ready(page, timeout_ms)
-			if await page.evaluate(_LOGIN_SHELL_READY_JS):
-				return
+		if await _wait_for_login_shell(page, min(attempt_timeout, WAF_READY_TIMEOUT_MS)):
+			closed = await dismiss_popups(page)
+			if closed:
+				print(f'[INFO] Dismissed {closed} popup dialog(s) on login page')
+			return
 
 		print(f'[WARN] Login page shell not ready on attempt {attempt + 1}')
 		await _log_login_page_state(page)
 		if provider and account_name:
 			await save_login_screenshot(page, provider, account_name, f'login-shell-attempt-{attempt + 1}')
-		if attempt < 2:
-			await asyncio.sleep(5)
+		if attempt == 0:
 			try:
-				await page.reload(wait_until='load', timeout=attempt_timeout)
-			except Exception:  # nosec B110
-				pass
+				print(f'[INFO] Warming up {base_url} before retry')
+				await page.goto(base_url, wait_until='domcontentloaded', timeout=attempt_timeout)
+				await wait_for_site_ready(page, min(timeout_ms, WAF_READY_TIMEOUT_MS))
+				closed = await dismiss_popups(page)
+				if closed:
+					print(f'[INFO] Dismissed {closed} popup dialog(s) during warmup')
+			except Exception as exc:
+				print(f'[WARN] Warmup navigation failed: {exc}')
 
 	raise TimeoutError(f'Login page never rendered: {login_url}')
 
 
-async def has_session_cookie(page: Page) -> bool:
-	cookies = await page.context.cookies()
-	return any(c.get('name') == SESSION_COOKIE_NAME and c.get('value') for c in cookies)
+async def get_session_cookie_value(page: Page, *, cookie_url: str | None = None) -> str | None:
+	cookies = await page.context.cookies(cookie_url) if cookie_url else await page.context.cookies()
+	for cookie in cookies:
+		if cookie.get('name') == SESSION_COOKIE_NAME and cookie.get('value'):
+			return str(cookie['value'])
+	return None
+
+
+async def has_session_cookie(page: Page, *, cookie_url: str | None = None) -> bool:
+	return await get_session_cookie_value(page, cookie_url=cookie_url) is not None
 
 
 def _extract_user_profile(payload: object) -> dict | None:
@@ -440,6 +436,32 @@ async def _fetch_user_profile(page: Page) -> dict | None:
 	return _extract_user_profile(payload)
 
 
+async def _read_stored_user_profile(page: Page) -> dict | None:
+	try:
+		payload = await page.evaluate(
+			"""() => {
+				try {
+					const raw = localStorage.getItem('user');
+					return raw ? JSON.parse(raw) : null;
+				} catch {
+					return null;
+				}
+			}"""
+		)
+	except Exception:  # nosec B110
+		return None
+	return _extract_user_profile(payload)
+
+
+def _profile_has_populated_quota(profile: dict) -> bool:
+	try:
+		quota = float(profile['quota'])
+		used_quota = float(profile['used_quota'])
+	except (KeyError, TypeError, ValueError):
+		return False
+	return quota != 0 or used_quota != 0
+
+
 async def is_logged_in(page: Page) -> bool:
 	"""快速判断：是否在 /console，或仍停留在登录页。"""
 	url = page.url.lower()
@@ -456,10 +478,17 @@ async def is_logged_in(page: Page) -> bool:
 	return False
 
 
-async def wait_for_session_cookie(page: Page, timeout_ms: int = SESSION_WAIT_TIMEOUT_MS) -> bool:
+async def wait_for_session_cookie(
+	page: Page,
+	timeout_ms: int = SESSION_WAIT_TIMEOUT_MS,
+	*,
+	cookie_url: str | None = None,
+	previous_value: str | None = None,
+) -> bool:
 	deadline = time.monotonic() + timeout_ms / 1000
 	while time.monotonic() < deadline:
-		if await has_session_cookie(page):
+		current_value = await get_session_cookie_value(page, cookie_url=cookie_url)
+		if current_value is not None and current_value != previous_value:
 			return True
 		await asyncio.sleep(0.5)
 	return False
@@ -480,30 +509,45 @@ async def verify_browser_login(page: Page, console_url: str, timeout_ms: int) ->
 
 	async def on_response(response) -> None:
 		nonlocal captured_profile
-		if captured_profile is not None:
+		if captured_profile is not None and _profile_has_populated_quota(captured_profile):
 			return
 		profile = await _parse_user_self_response(response)
 		if profile:
 			captured_profile = profile
 
 	page.on('response', on_response)
+	profile_fallback: dict | None = None
 	try:
 		print(f'[INFO] Verifying login via {console_url} and {USER_SELF_API_SUFFIX}')
-		await page.goto(console_url, wait_until='load', timeout=min(timeout_ms, 60_000))
-		try:
-			await page.wait_for_load_state('networkidle', timeout=20_000)
-		except Exception:  # nosec B110
-			pass
+		await page.goto(console_url, wait_until='domcontentloaded', timeout=min(timeout_ms, 60_000))
 
-		if captured_profile is None:
-			for attempt in range(3):
-				captured_profile = await _fetch_user_profile(page)
-				if captured_profile is not None:
+		for attempt in range(20):
+			if captured_profile is not None:
+				profile_fallback = captured_profile
+				if _profile_has_populated_quota(captured_profile):
 					break
-				if attempt < 2:
-					await asyncio.sleep(1)
+				captured_profile = None
+
+			stored_profile = await _read_stored_user_profile(page)
+			if stored_profile is not None:
+				profile_fallback = stored_profile
+				if _profile_has_populated_quota(stored_profile):
+					captured_profile = stored_profile
+					break
+
+			fetched_profile = await _fetch_user_profile(page)
+			if fetched_profile is not None:
+				profile_fallback = fetched_profile
+				if _profile_has_populated_quota(fetched_profile):
+					captured_profile = fetched_profile
+					break
+
+			if attempt < 19:
+				await asyncio.sleep(0.5)
 	finally:
 		page.remove_listener('response', on_response)
+	if captured_profile is None:
+		captured_profile = profile_fallback
 
 	if captured_profile:
 		if is_debug_enabled():
@@ -871,4 +915,24 @@ async def click_github_login_entry(
 	debug_print(f'[INFO] GitHub login entry not found on {page.url}')
 	if provider and account_name:
 		await save_login_screenshot(page, provider, account_name, 'github-entry-timeout')
+	return False
+
+
+async def confirm_github_oauth(page: Page, timeout_ms: int = 10_000) -> bool:
+	"""在 GitHub OAuth 确认页点击 Authorize 或 Reauthorize。"""
+	action_timeout = min(timeout_ms, FORM_ACTION_TIMEOUT_MS)
+	button = page.get_by_role('button', name=re.compile(r'^(?:Re)?Authorize\b', re.I)).first
+	deadline = time.monotonic() + action_timeout / 1000
+	while time.monotonic() < deadline:
+		if page.is_closed():
+			return False
+		if page.url != 'about:blank' and 'github.com/login/oauth/authorize' not in page.url:
+			return False
+		try:
+			if await button.is_visible():
+				await button.click(timeout=action_timeout)
+				return True
+		except Exception as exc:  # nosec B110
+			debug_print(f'[INFO] GitHub OAuth confirmation button check failed: {exc}')
+		await asyncio.sleep(0.2)
 	return False

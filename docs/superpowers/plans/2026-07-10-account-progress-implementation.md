@@ -140,7 +140,7 @@ Verify that `pyproject.toml` contains the following runtime dependency and that 
 ```toml
 dependencies = [
   "httpx[http2]>=0.24.0",
-  "cloakbrowser>=0.3.0",
+  "cloakbrowser>=0.4.10",
   "python-dotenv>=1.0.0",
   "rich>=13.9.4",
 ]

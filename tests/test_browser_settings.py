@@ -4,7 +4,13 @@ from types import SimpleNamespace
 import pytest
 
 import utils.browser as browser_module
-from utils.browser import launch_login_context, load_browser_login_settings, verify_browser_login
+from utils.browser import (
+	confirm_github_oauth,
+	launch_login_context,
+	load_browser_login_settings,
+	verify_browser_login,
+	wait_for_session_cookie,
+)
 
 
 def test_browser_login_settings_records_profile_persistence(monkeypatch, tmp_path):
@@ -138,13 +144,17 @@ def test_browser_login_settings_can_reset_named_profile(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 async def test_verify_browser_login_actively_retries_user_info(monkeypatch):
 	profile = {'id': 123456, 'quota': 12_625_000, 'used_quota': 112_375_000}
-	payloads = [None, {'success': True, 'data': profile}]
+	payloads = [
+		{'success': True, 'data': {'id': 123456, 'quota': 0, 'used_quota': 0}},
+		{'success': True, 'data': profile},
+	]
 	sleeps = []
 
 	class FakePage:
 		def __init__(self):
 			self.url = 'about:blank'
 			self.evaluations = []
+			self.load_states = []
 
 		def on(self, event, callback):
 			pass
@@ -156,10 +166,12 @@ async def test_verify_browser_login_actively_retries_user_info(monkeypatch):
 			self.url = url
 
 		async def wait_for_load_state(self, state, timeout):
-			pass
+			self.load_states.append(state)
 
-		async def evaluate(self, expression, arg):
-			self.evaluations.append(arg)
+		async def evaluate(self, expression, *args):
+			if not args:
+				return None
+			self.evaluations.append(args[0])
 			return payloads.pop(0)
 
 	async def fake_sleep(delay):
@@ -172,4 +184,217 @@ async def test_verify_browser_login_actively_retries_user_info(monkeypatch):
 
 	assert result == profile
 	assert page.evaluations == ['/api/user/self', '/api/user/self']
-	assert sleeps == [1]
+	assert page.load_states == []
+	assert sleeps == [0.5]
+
+
+@pytest.mark.asyncio
+async def test_verify_browser_login_uses_current_local_storage_user():
+	profile = {'id': 123456, 'quota': 12_625_000, 'used_quota': 112_375_000}
+
+	class FakePage:
+		def __init__(self):
+			self.url = 'about:blank'
+
+		def on(self, event, callback):
+			pass
+
+		def remove_listener(self, event, callback):
+			pass
+
+		async def goto(self, url, **kwargs):
+			self.url = url
+
+		async def evaluate(self, expression, *args):
+			if args:
+				return None
+			return profile
+
+	result = await verify_browser_login(FakePage(), 'https://agentrouter.org/console', 60_000)
+
+	assert result == profile
+
+
+@pytest.mark.asyncio
+async def test_verify_browser_login_waits_for_storage_quota_to_populate(monkeypatch):
+	placeholder = {'id': 123456, 'quota': 0, 'used_quota': 0}
+	profile = {'id': 123456, 'quota': 12_625_000, 'used_quota': 112_375_000}
+	stored_profiles = [placeholder, profile]
+	sleeps = []
+
+	class FakePage:
+		def __init__(self):
+			self.url = 'about:blank'
+
+		def on(self, event, callback):
+			pass
+
+		def remove_listener(self, event, callback):
+			pass
+
+		async def goto(self, url, **kwargs):
+			self.url = url
+
+		async def evaluate(self, expression, *args):
+			if args:
+				return None
+			return stored_profiles.pop(0)
+
+	async def fake_sleep(delay):
+		sleeps.append(delay)
+
+	monkeypatch.setattr(browser_module.asyncio, 'sleep', fake_sleep)
+
+	result = await verify_browser_login(FakePage(), 'https://agentrouter.org/console', 60_000)
+
+	assert result == profile
+	assert sleeps == [0.5]
+
+
+@pytest.mark.asyncio
+async def test_wait_for_session_cookie_scopes_lookup_to_provider_url():
+	class FakeContext:
+		def __init__(self):
+			self.urls = []
+
+		async def cookies(self, url=None):
+			self.urls.append(url)
+			return [{'name': 'session', 'value': 'provider-session'}]
+
+	class FakePage:
+		def __init__(self):
+			self.context = FakeContext()
+
+	page = FakePage()
+
+	result = await wait_for_session_cookie(
+		page,
+		1_000,
+		cookie_url='https://agentrouter.org',
+		previous_value='login-session',
+	)
+
+	assert result is True
+	assert page.context.urls == ['https://agentrouter.org']
+
+
+@pytest.mark.asyncio
+async def test_confirm_github_oauth_clicks_only_authorize_button():
+	class FakeButton:
+		def __init__(self):
+			self.clicked = False
+
+		async def is_visible(self):
+			return True
+
+		async def click(self, *, timeout):
+			self.clicked = timeout
+
+	class FakeRole:
+		def __init__(self, button):
+			self.first = button
+
+	class FakePage:
+		def __init__(self):
+			self.url = 'about:blank'
+			self.button = FakeButton()
+			self.requested_name = None
+
+		def get_by_role(self, role, *, name):
+			assert role == 'button'
+			self.requested_name = name
+			return FakeRole(self.button)
+
+		def is_closed(self):
+			return False
+
+	page = FakePage()
+
+	result = await confirm_github_oauth(page, 10_000)
+
+	assert result is True
+	assert page.requested_name.search('Authorize agentrouter-org')
+	assert page.requested_name.search('Reauthorize application')
+	assert not page.requested_name.search('Cancel')
+	assert page.button.clicked == 10_000
+
+
+@pytest.mark.asyncio
+async def test_confirm_github_oauth_stops_when_popup_redirects(monkeypatch):
+	sleeps = []
+
+	class FakeButton:
+		async def is_visible(self):
+			return False
+
+	class FakeRole:
+		first = FakeButton()
+
+	class FakePage:
+		def __init__(self):
+			self.url = 'about:blank'
+
+		def get_by_role(self, role, *, name):
+			return FakeRole()
+
+		def is_closed(self):
+			return False
+
+	page = FakePage()
+
+	async def fake_sleep(delay):
+		sleeps.append(delay)
+		page.url = 'https://agentrouter.org/console'
+
+	monkeypatch.setattr(browser_module.asyncio, 'sleep', fake_sleep)
+
+	result = await confirm_github_oauth(page, 10_000)
+
+	assert result is False
+	assert sleeps == [0.2]
+
+
+@pytest.mark.asyncio
+async def test_navigate_login_page_returns_when_shell_is_ready_without_settle_waits(monkeypatch):
+	class FakePage:
+		def __init__(self):
+			self.url = 'about:blank'
+			self.gotos = []
+			self.load_states = []
+
+		async def goto(self, url, **kwargs):
+			self.url = url
+			self.gotos.append((url, kwargs['wait_until']))
+
+		async def wait_for_load_state(self, state, timeout):
+			self.load_states.append(state)
+
+		async def wait_for_function(self, expression, timeout):
+			return None
+
+		async def evaluate(self, expression):
+			return True
+
+	page = FakePage()
+	sleeps = []
+
+	async def fake_sleep(delay):
+		sleeps.append(delay)
+
+	async def fake_dismiss_popups(page_arg):
+		return 0
+
+	monkeypatch.setattr(browser_module.asyncio, 'sleep', fake_sleep)
+	monkeypatch.setattr(browser_module, 'dismiss_popups', fake_dismiss_popups)
+
+	await browser_module.navigate_login_page(
+		page,
+		'https://agentrouter.org/login',
+		60_000,
+		provider='agentrouter',
+		account_name='main',
+	)
+
+	assert page.gotos == [('https://agentrouter.org/login', 'domcontentloaded')]
+	assert 'networkidle' not in page.load_states
+	assert sleeps == []

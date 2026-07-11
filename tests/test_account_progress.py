@@ -69,6 +69,23 @@ def test_progress_display_renders_step_attempt_and_final_balance():
 	assert '完成 $31.80 (+25)' in output
 
 
+def test_progress_timer_starts_only_when_account_begins(monkeypatch):
+	stream = TtyBuffer()
+	console = Console(file=stream, force_terminal=True, color_system=None, width=120)
+	log = checkin._AccountLog('main', 'main │ ', emit_lines=False)
+	display = checkin._AccountProgressDisplay([log], console=console, auto_refresh=False)
+	task = display.progress.tasks[0]
+
+	assert task.start_time is None
+	assert log.start is None
+
+	monkeypatch.setattr(checkin.time, 'monotonic', lambda: 123.0)
+	display.start_account(log)
+
+	assert task.start_time is not None
+	assert log.start == 123.0
+
+
 def test_progress_display_routes_stderr_through_live_and_restores_identity(monkeypatch):
 	stream = TtyBuffer()
 	stderr = TtyBuffer()

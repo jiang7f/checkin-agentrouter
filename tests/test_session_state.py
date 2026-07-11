@@ -208,6 +208,18 @@ async def test_github_browser_checkin_reuses_browser_user_profile(monkeypatch):
 	assert saved == {'account_name': 'profile_main', 'cookies': {'session': 'new-session'}, 'api_user': 'new-user'}
 
 
+def test_browser_user_profile_rejects_zero_quota_placeholder():
+	result = checkin.user_info_from_browser_profile(
+		{
+			'id': 123456,
+			'quota': 0,
+			'used_quota': 0,
+		}
+	)
+
+	assert result is None
+
+
 @pytest.mark.asyncio
 async def test_previous_session_balance_retries_three_times_before_checkin(monkeypatch):
 	account = AccountConfig(
