@@ -81,9 +81,9 @@ async def test_github_checkin_retries_reuse_one_previous_balance_query(monkeypat
 	query_calls = []
 	checkin_calls = []
 
-	async def fake_query_previous_session_balance(account, account_index, app_config, *, max_attempts=3):
+	async def fake_check_in_with_previous_session(account, account_index, app_config, *, max_attempts=3):
 		query_calls.append(max_attempts)
-		return before
+		return False, before, None
 
 	async def fake_check_in_account(
 		account,
@@ -99,7 +99,7 @@ async def test_github_checkin_retries_reuse_one_previous_balance_query(monkeypat
 			return False, user_info_before, {'success': False, 'error': 'temporary failure'}
 		return True, user_info_before, after
 
-	monkeypatch.setattr(checkin, 'query_previous_session_balance', fake_query_previous_session_balance)
+	monkeypatch.setattr(checkin, 'check_in_with_previous_session', fake_check_in_with_previous_session)
 	monkeypatch.setattr(checkin, 'check_in_account', fake_check_in_account)
 
 	result = await checkin.check_in_account_with_retries(FakeGithubAccount(), 0, object(), max_retries=5)
@@ -120,14 +120,14 @@ async def test_github_checkin_stops_retrying_when_profile_requires_login(monkeyp
 
 	attempts = []
 
-	async def fake_query_previous_session_balance(account, account_index, app_config, *, max_attempts=3):
+	async def fake_check_in_with_previous_session(account, account_index, app_config, *, max_attempts=3):
 		return None
 
 	async def fake_check_in_account(account, account_index, app_config, **kwargs):
 		attempts.append(account_index)
 		return False, None, None
 
-	monkeypatch.setattr(checkin, 'query_previous_session_balance', fake_query_previous_session_balance)
+	monkeypatch.setattr(checkin, 'check_in_with_previous_session', fake_check_in_with_previous_session)
 	monkeypatch.setattr(checkin, 'check_in_account', fake_check_in_account)
 	monkeypatch.setattr(checkin, 'get_profile_status', lambda *args, **kwargs: 'expired')
 
