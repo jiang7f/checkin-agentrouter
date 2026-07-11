@@ -147,10 +147,11 @@ AgentRouter Check-in
 `本次签到+xx` 的判断来自上一次保存的 AgentRouter 登录态：
 
 - 每次成功后只保存上一次 AgentRouter 的 `session` 和 `api_user`
-- 下次运行先用旧登录态查签到前余额
-- 再用 GitHub profile 重新 OAuth 登录 AgentRouter 触发签到
+- 下次运行先用旧登录态查签到前余额，临时失败时最多尝试 3 次
+- 余额查询完成后固定这次结果，再用 GitHub profile 重新 OAuth 登录 AgentRouter 触发签到
+- OAuth 签到最多执行 6 次，重试时不会再次查询签到前余额
 - 最后查签到后余额，两者差值显示为 `本次签到+xx`
-- 首次运行没有旧登录态，只显示当前余额，不显示增量
+- 首次运行或旧登录态连续 3 次都查不到余额时，只显示当前余额，不显示增量
 
 这个行为有回归测试覆盖。
 

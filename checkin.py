@@ -1266,7 +1266,71 @@ def get_checkin_concurrency() -> int:
 		return 3
 
 
-async def check_in_account(account: AccountConfig, account_index: int, app_config: AppConfig):
+async def query_previous_session_balance(
+	account: AccountConfig,
+	account_index: int,
+	app_config: AppConfig,
+	*,
+	max_attempts: int = 3,
+) -> dict | None:
+	"""用上一次成功保存的 session 查询签到前余额，失败时独立重试。"""
+	account_name = account.get_display_name(account_index)
+	provider_config = app_config.get_provider(account.provider)
+	if not provider_config:
+		return None
+
+	_set_account_step(1, '查询签到前余额')
+	previous_session = load_last_session(account_name)
+	if not previous_session:
+		print(f'[INFO] {account_name}: No previous AgentRouter session; first run will not show check-in increment')
+		return None
+
+	print(f'[INFO] {account_name}: Reading balance with previous AgentRouter session')
+	# 旧状态只持久化 session cookie。WAF cookie 仅为本轮查询临时补齐，不写入本地状态。
+	max_attempts = max(max_attempts, 1)
+	for attempt in range(1, max_attempts + 1):
+		before_cookies = await prepare_cookies(account_name, provider_config, previous_session['cookies'])
+
+		if before_cookies:
+			user_info_before = await asyncio.to_thread(
+				run_user_info_request,
+				before_cookies,
+				account,
+				account_name,
+				provider_config,
+				api_user_override=previous_session.get('api_user'),
+				use_proxy=provider_config.use_proxy,
+			)
+			if user_info_before and user_info_before.get('success'):
+				print(user_info_before.get('display', f':money: Current balance: ${user_info_before["quota"]}'))
+				return user_info_before
+			error = user_info_before.get('error', 'Unknown error') if user_info_before else 'No response'
+			print(
+				f'[WARN] {account_name}: Previous session balance query failed '
+				f'({attempt}/{max_attempts}): {error}'
+			)
+		else:
+			print(
+				f'[WARN] {account_name}: Unable to prepare WAF cookies for previous-session balance query '
+				f'({attempt}/{max_attempts})'
+			)
+
+		if attempt < max_attempts:
+			print(f'[RETRY] {account_name}: retrying previous-session balance query')
+			await asyncio.sleep(1)
+
+	print(f'[WARN] {account_name}: Previous-session balance unavailable; check-in increment will be omitted')
+	return None
+
+
+async def check_in_account(
+	account: AccountConfig,
+	account_index: int,
+	app_config: AppConfig,
+	*,
+	user_info_before: dict | None = None,
+	query_previous_balance: bool = True,
+):
 	"""为单个账号执行签到操作"""
 	account_name = account.get_display_name(account_index)
 	print(f'\n[PROCESSING] Starting to process {account_name}')
@@ -1282,33 +1346,9 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 	all_cookies = None
 	resolved_api_user: str | None = None
 	auth_method = None
-	user_info_before = None
 	if account.uses_github_browser():
-		_set_account_step(1, '查询签到前余额')
-		previous_session = load_last_session(account_name)
-		if previous_session:
-			print(f'[INFO] {account_name}: Reading balance with previous AgentRouter session')
-			# 旧会话只保存了 session cookie；provider 若需要 WAF cookie（如 agentrouter 的 acw_tc），
-			# 要先补齐再查，否则 before 查询会被 WAF 挡下，导致签到增量长期不显示。
-			before_cookies = await prepare_cookies(account_name, provider_config, previous_session['cookies'])
-			if before_cookies:
-				user_info_before = await asyncio.to_thread(
-					run_user_info_request,
-					before_cookies,
-					account,
-					account_name,
-					provider_config,
-					api_user_override=previous_session.get('api_user'),
-					use_proxy=provider_config.use_proxy,
-				)
-				if user_info_before and user_info_before.get('success'):
-					print(user_info_before.get('display', f':money: Current balance: ${user_info_before["quota"]}'))
-				elif user_info_before:
-					print(f'[WARN] {account_name}: Previous session balance query failed: {user_info_before.get("error", "Unknown error")}')
-			else:
-				print(f'[WARN] {account_name}: Unable to prepare WAF cookies for previous-session balance query; skipping increment')
-		else:
-			print(f'[INFO] {account_name}: No previous AgentRouter session; first run will not show check-in increment')
+		if query_previous_balance:
+			user_info_before = await query_previous_session_balance(account, account_index, app_config)
 
 		_set_account_step(2, 'GitHub OAuth 登录')
 		login_result = await login_with_github_browser(account, account_name, provider_config, account.provider)
@@ -1337,7 +1377,7 @@ async def check_in_account(account: AccountConfig, account_index: int, app_confi
 			return False, user_info_before, user_info_after
 		else:
 			print(f'[FAILED] {account_name}: GitHub browser login failed, will not use stale session cookies')
-			return False, None, None
+			return False, user_info_before, None
 	elif account.has_login_credentials():
 		_set_account_step(1, '准备账号')
 		print(f'[INFO] {account_name}: Attempting email/password login (priority)...')
@@ -1395,14 +1435,29 @@ async def check_in_account_with_retries(
 	last_result: tuple[bool, dict | None, dict | None] = (False, None, None)
 	account_name = account.get_display_name(account_index)
 	max_attempts = max_retries + 1
+	user_info_before = None
+	is_github_browser = account.uses_github_browser()
+
+	_set_account_attempt(1, max_attempts)
+	if is_github_browser:
+		user_info_before = await query_previous_session_balance(account, account_index, app_config, max_attempts=3)
 
 	for attempt in range(1, max_attempts + 1):
-		_set_account_attempt(attempt, max_attempts)
 		if attempt > 1:
+			_set_account_attempt(attempt, max_attempts)
 			_set_account_step(0, '准备重试')
 			print(f'[RETRY] {account_name}: retrying check-in ({attempt - 1}/{max_retries})')
 
-		last_result = await check_in_account(account, account_index, app_config)
+		if is_github_browser:
+			last_result = await check_in_account(
+				account,
+				account_index,
+				app_config,
+				user_info_before=user_info_before,
+				query_previous_balance=False,
+			)
+		else:
+			last_result = await check_in_account(account, account_index, app_config)
 		success, _, _ = last_result
 		if success:
 			return last_result
@@ -1443,8 +1498,8 @@ async def process_account_for_main(
 			account_detail['after_quota'] = current_quota
 			current_balance = {'quota': current_quota, 'used': current_used}
 
-			# 仅当上一次会话余额（签到前）也拿到时，才计算并展示本次签到增量。
-			# 拿不到（首次运行、旧会话过期、WAF 拦截等）则保持 None，不显示括号提示。
+			# 签到前余额会在 OAuth 重试前独立查询并固定。连续三次拿不到时保持 None，
+			# 后续签到仍可重试，但通知不显示本次增量。
 			if user_info_before and user_info_before.get('success'):
 				account_detail['check_in_reward'] = calculate_check_in_reward(user_info_before, user_info_after)
 
