@@ -1422,7 +1422,7 @@ async def query_post_login_balance(
 	provider_config,
 	login_result: BrowserLoginResult,
 	*,
-	max_attempts: int = 1,
+	max_attempts: int = 3,
 ) -> dict | None:
 	"""OAuth 成功后快速查询余额，失败时不重新登录。"""
 	user_info = user_info_from_browser_profile(login_result.user_profile)

@@ -234,6 +234,7 @@ async def test_github_browser_checkin_does_not_repeat_oauth_when_post_balance_is
 	provider = ProviderConfig(name='agentrouter', domain='https://agentrouter.org', sign_in_path=None)
 	app_config = AppConfig(providers={'agentrouter': provider})
 	calls = {'login': 0, 'prepare': 0, 'user_info': 0}
+	request_cookies = []
 	saved = {}
 	sleeps = []
 
@@ -247,6 +248,7 @@ async def test_github_browser_checkin_does_not_repeat_oauth_when_post_balance_is
 
 	def fake_run_user_info_request(*args, **kwargs):
 		calls['user_info'] += 1
+		request_cookies.append(dict(args[0]))
 		return {'success': False, 'error': 'non-json response'}
 
 	async def fake_prepare_cookies(account_name, provider_config, cookies):
@@ -271,8 +273,9 @@ async def test_github_browser_checkin_does_not_repeat_oauth_when_post_balance_is
 	result = await checkin.check_in_account_with_retries(account, 0, app_config)
 
 	assert result == (True, None, None)
-	assert calls == {'login': 1, 'prepare': 0, 'user_info': 1}
-	assert sleeps == []
+	assert calls == {'login': 1, 'prepare': 0, 'user_info': 3}
+	assert request_cookies == [{'session': 'new-session'}] * 3
+	assert sleeps == [1, 1]
 	assert saved == {'account_name': 'profile_main', 'cookies': {'session': 'new-session'}, 'api_user': 'new-user'}
 
 
