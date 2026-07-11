@@ -11,6 +11,7 @@ import os
 import sys
 import threading
 import time
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlencode, urlparse
@@ -33,8 +34,39 @@ _current_log: contextvars.ContextVar = contextvars.ContextVar('checkin_current_l
 _oauth_gate: contextvars.ContextVar[asyncio.Semaphore | None] = contextvars.ContextVar(
 	'checkin_oauth_gate', default=None
 )
-_previous_balance_gate: contextvars.ContextVar[asyncio.Semaphore | None] = contextvars.ContextVar(
-	'checkin_previous_balance_gate', default=None
+
+
+class _BalanceQueryGate:
+	"""串行余额查询，并让签到后查询优先于尚未开始的签到前查询。"""
+
+	def __init__(self) -> None:
+		self._condition = asyncio.Condition()
+		self._locked = False
+		self._post_waiters = 0
+
+	@asynccontextmanager
+	async def hold(self, *, post_login: bool):
+		async with self._condition:
+			if post_login:
+				self._post_waiters += 1
+			try:
+				await self._condition.wait_for(
+					lambda: not self._locked and (post_login or self._post_waiters == 0)
+				)
+				self._locked = True
+			finally:
+				if post_login:
+					self._post_waiters -= 1
+		try:
+			yield
+		finally:
+			async with self._condition:
+				self._locked = False
+				self._condition.notify_all()
+
+
+_balance_query_gate: contextvars.ContextVar[_BalanceQueryGate | None] = contextvars.ContextVar(
+	'checkin_balance_query_gate', default=None
 )
 _PREFIX_COLORS = (36, 32, 33, 35, 34, 31)  # cyan / green / yellow / magenta / blue / red
 
@@ -333,7 +365,6 @@ from utils.browser import (
 	login_with_email_form,
 	navigate_login_page,
 	prepare_browser_page,
-	read_browser_user_profile,
 	save_login_screenshot,
 	take_pending_screenshots,
 	verify_browser_login,
@@ -707,31 +738,6 @@ def _github_profile_requires_login(oauth_page) -> bool:
 	return oauth_page is not None and not oauth_page.is_closed() and oauth_page.url.startswith(GITHUB_LOGIN_URL)
 
 
-async def query_browser_post_login_profile(
-	page,
-	account_name: str,
-	api_user: str | None,
-	initial_profile: dict | None,
-	*,
-	max_attempts: int = 3,
-) -> dict | None:
-	"""OAuth 浏览器关闭前，用同一上下文独立重试余额资料。"""
-	candidate = initial_profile
-	max_attempts = max(max_attempts, 1)
-	for attempt in range(1, max_attempts + 1):
-		_set_account_step(3, f'查询签到后余额 {attempt}/{max_attempts}')
-		if user_info_from_browser_profile(candidate):
-			return candidate
-		candidate = await read_browser_user_profile(page, api_user=api_user)
-		if user_info_from_browser_profile(candidate):
-			return candidate
-		print(f'[WARN] {account_name}: Browser balance query failed ({attempt}/{max_attempts})')
-		if attempt < max_attempts:
-			# 控制台会先渲染 $0.00 占位值，再异步更新真实余额。刷新会重新开始加载。
-			await asyncio.sleep(2)
-	return initial_profile
-
-
 async def perform_github_browser_login(
 	account_name: str,
 	provider_config,
@@ -835,32 +841,6 @@ async def perform_github_browser_login(
 			await context.close()
 			return None
 		api_user = str(user_profile['id']) if user_profile and user_profile.get('id') is not None else None
-		if not user_info_from_browser_profile(user_profile):
-			balance_page = await context.new_page()
-			try:
-				await prepare_browser_page(balance_page)
-				await balance_page.goto(
-					console_url,
-					wait_until='domcontentloaded',
-					timeout=min(timeout_ms, 60_000),
-				)
-				user_profile = await query_browser_post_login_profile(
-					balance_page,
-					account_name,
-					api_user,
-					user_profile,
-				)
-				if not user_info_from_browser_profile(user_profile):
-					await save_login_screenshot(
-						balance_page,
-						provider_name,
-						account_name,
-						'post-login-balance-unavailable',
-					)
-			finally:
-				await balance_page.close()
-			if api_user is None and user_profile and user_profile.get('id') is not None:
-				api_user = str(user_profile['id'])
 		print(f'[SUCCESS] {account_name}: GitHub browser login successful, got {len(all_cookies)} cookies')
 		await context.close()
 		return BrowserLoginResult(cookies=all_cookies, api_user=api_user, user_profile=user_profile)
@@ -1482,11 +1462,11 @@ async def query_previous_session_balance(
 		print(f'[WARN] {account_name}: Previous-session balance unavailable; check-in increment will be omitted')
 		return None
 
-	gate = _previous_balance_gate.get()
+	gate = _balance_query_gate.get()
 	if gate is None:
 		return await run_attempts()
 	_set_account_step(1, '等待签到前余额查询槽位')
-	async with gate:
+	async with gate.hold(post_login=False):
 		return await run_attempts()
 
 
@@ -1506,15 +1486,65 @@ async def query_post_login_balance(
 	account_name: str,
 	provider_config,
 	login_result: BrowserLoginResult,
+	*,
+	max_attempts: int = 3,
 ) -> dict | None:
-	"""读取 OAuth 浏览器在关闭前已经查询到的余额。"""
-	user_info = user_info_from_browser_profile(login_result.user_profile)
-	if user_info:
-		print(f'[INFO] {account_name}: Reusing user info verified in browser')
-		return user_info
+	"""OAuth 释放并发槽位后，用新 session 独立重试签到后余额。"""
+	session_cookie = login_result.cookies.get('session')
+	if not session_cookie:
+		print(f'[WARN] {account_name}: Check-in succeeded but new session cookie is unavailable')
+		return None
 
-	print(f'[WARN] {account_name}: Check-in succeeded but post-login balance is unavailable')
-	return None
+	async def run_attempts() -> dict | None:
+		max_attempt_count = max(max_attempts, 1)
+		for attempt in range(1, max_attempt_count + 1):
+			_set_account_step(3, f'查询签到后余额 {attempt}/{max_attempt_count}')
+			post_cookies = await prepare_cookies(
+				account_name,
+				provider_config,
+				{'session': session_cookie},
+			)
+			if post_cookies:
+				user_info = await asyncio.to_thread(
+					run_user_info_request,
+					post_cookies,
+					account,
+					account_name,
+					provider_config,
+					api_user_override=login_result.api_user,
+					use_proxy=provider_config.use_proxy,
+				)
+				if user_info_has_balance(user_info):
+					if not user_info.get('display'):
+						user_info = {
+							**user_info,
+							'display': (
+								f':money: Current balance: ${user_info["quota"]}, '
+								f'Used: ${user_info["used_quota"]}'
+							),
+						}
+					return user_info
+				error = user_info.get('error', 'zero balance placeholder') if user_info else 'No response'
+				print(
+					f'[WARN] {account_name}: Post-login balance query failed '
+					f'({attempt}/{max_attempt_count}): {error}'
+				)
+			else:
+				print(
+					f'[WARN] {account_name}: Unable to prepare WAF cookies for post-login balance query '
+					f'({attempt}/{max_attempt_count})'
+				)
+			if attempt < max_attempt_count:
+				await asyncio.sleep(1)
+		print(f'[WARN] {account_name}: Check-in succeeded but post-login balance is unavailable')
+		return None
+
+	gate = _balance_query_gate.get()
+	if gate is None:
+		return await run_attempts()
+	_set_account_step(3, '等待签到后余额查询槽位')
+	async with gate.hold(post_login=True):
+		return await run_attempts()
 
 
 async def check_in_account(
@@ -1827,7 +1857,7 @@ async def main():
 	print(f'[INFO] GitHub OAuth concurrency: {oauth_concurrency}')
 	semaphore = asyncio.Semaphore(concurrency)
 	oauth_semaphore = asyncio.Semaphore(oauth_concurrency)
-	previous_balance_semaphore = asyncio.Semaphore(1)
+	balance_query_gate = _BalanceQueryGate()
 	parallel_output = concurrency > 1 and len(accounts) > 1
 	progress_output = _should_use_progress(concurrency, len(accounts))
 	prefix_width = max((len(account.get_display_name(index)) for index, account in enumerate(accounts)), default=0)
@@ -1868,7 +1898,7 @@ async def main():
 
 	heartbeat_task = asyncio.create_task(_heartbeat(active_logs)) if parallel_output and not progress_output else None
 	oauth_gate_token = _oauth_gate.set(oauth_semaphore)
-	previous_balance_gate_token = _previous_balance_gate.set(previous_balance_semaphore)
+	balance_query_gate_token = _balance_query_gate.set(balance_query_gate)
 	try:
 		account_tasks: list[asyncio.Task] = []
 		if progress_display is not None:
@@ -1904,7 +1934,7 @@ async def main():
 			)
 		raise
 	finally:
-		_previous_balance_gate.reset(previous_balance_gate_token)
+		_balance_query_gate.reset(balance_query_gate_token)
 		_oauth_gate.reset(oauth_gate_token)
 
 	if progress_output:

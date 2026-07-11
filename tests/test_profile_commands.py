@@ -218,7 +218,7 @@ async def test_check_in_account_passes_browser_profile_to_github_login(monkeypat
 
 	def fake_run_user_info_request(cookies, account_arg, account_name, provider_config, **kwargs):
 		calls['check_in'] = kwargs
-		return {'success': True, 'quota': 35, 'used_quota': 0}
+		return {'success': True, 'quota': 35.0, 'used_quota': 0.0}
 
 	monkeypatch.setattr(checkin, 'login_with_github_browser', fake_login_with_github_browser)
 	monkeypatch.setattr(checkin, 'run_user_info_request', fake_run_user_info_request)
@@ -236,4 +236,5 @@ async def test_check_in_account_passes_browser_profile_to_github_login(monkeypat
 		'display': ':money: Current balance: $35.0, Used: $0.0',
 	}
 	assert calls['login'] == ('profile_main', 'github-account', 'agentrouter', 'agentrouter')
-	assert 'check_in' not in calls
+	assert calls['check_in']['api_user_override'] == '123456'
+	assert calls['check_in']['use_proxy'] is True
