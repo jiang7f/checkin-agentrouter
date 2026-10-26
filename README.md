@@ -23,7 +23,7 @@ English summary: Local AgentRouter daily check-in automation with multi-account 
 - [uv](https://docs.astral.sh/uv/)
 - 可正常访问 GitHub 和 AgentRouter 的网络环境
 
-项目当前要求 `cloakbrowser>=0.4.10`。
+项目当前要求 `cloakbrowser>=0.6.4`，具体安装版本由 `uv.lock` 锁定。
 
 ## 快速开始
 
@@ -348,12 +348,18 @@ CHECKIN_OAUTH_CONCURRENCY=2
 
 ### CloakBrowser 提示有新版本
 
-同步更新依赖和浏览器运行时：
+拉取仓库更新后，同步锁定的依赖并检查浏览器运行时：
 
 ```bash
-uv sync --upgrade
+git pull --ff-only
+uv sync --locked --dev
 uv run python -m cloakbrowser install
+uv run python -m cloakbrowser info
 ```
+
+如果要自行升级 CloakBrowser Python 包，可以执行 `uv sync --upgrade-package cloakbrowser --dev`，然后重新执行上面的 `install` 和 `info` 命令。该操作会更新 `uv.lock`。
+
+Python 包版本和 Chromium 内核版本是两回事。CloakBrowser 0.6.4 在未配置许可证的 macOS 上仍使用 Chromium 145。提示中的 Pro 新内核需要单独登录或配置许可证，升级 Python 包不会自动启用，Pro 提示也不代表依赖更新失败。
 
 ## 本地状态和安全
 
