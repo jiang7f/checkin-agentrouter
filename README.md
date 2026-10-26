@@ -346,6 +346,12 @@ CHECKIN_OAUTH_CONCURRENCY=2
 
 这是预期行为。动态进度条只在交互 TTY 中启用，`launchd` 和重定向日志使用逐行输出，避免日志中出现重复刷新字符。
 
+### 签到时 Dock 轻微跳动
+
+macOS 可能在无窗口 Chromium 启动时短暂显示它的 Dock 图标。自动签到现在会使用标记为后台应用的浏览器副本，避免这个启动动画。副本首次运行时创建，缓存在 `~/Library/Caches/checkin-agentrouter/browsers/`，后续直接复用，浏览器内核更新后自动重新生成。
+
+`add` 添加账号时仍打开正常浏览器窗口。设置 `CHECKIN_HEADLESS=false` 或自行指定 `CLOAKBROWSER_BINARY_PATH` 时，使用你指定的启动方式。如果后台副本准备失败，脚本会输出警告并使用原浏览器继续签到。
+
 ### CloakBrowser 提示有新版本
 
 拉取仓库更新后，同步锁定的依赖并检查浏览器运行时：

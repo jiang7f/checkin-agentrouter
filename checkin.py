@@ -373,6 +373,7 @@ from utils.browser import (
 )
 from utils.config import AccountConfig, AppConfig, load_accounts_config, load_agentrouter_profile_accounts
 from utils.debug import debug_print, is_debug_enabled
+from utils.macos_browser import configure_macos_background_browser
 from utils.notify import notify
 from utils.profiles import (
 	delete_profile,
@@ -2001,6 +2002,7 @@ def run_main():
 	try:
 		args = sys.argv[1:]
 		if not args:
+			configure_macos_background_browser()
 			asyncio.run(main())
 			return
 
