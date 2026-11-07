@@ -7,6 +7,7 @@ import asyncio
 import contextvars
 import hashlib
 import json
+import math
 import os
 import sys
 import threading
@@ -351,7 +352,7 @@ import httpx
 from cloakbrowser import launch_async
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(Path.cwd() / '.env')
 
 from utils.browser import (
 	BrowserLoginResult,
@@ -394,6 +395,7 @@ CLI_COMMAND = 'checkin-agentrouter'
 GITHUB_LOGIN_URL = 'https://github.com/login'
 GITHUB_PROFILE_URL = 'https://github.com/settings/profile'
 NOTIFICATION_TITLE = 'AgentRouter Check-in'
+_browser_balance_domains: set[str] = set()
 
 
 def load_balance_hash():
@@ -799,7 +801,7 @@ async def perform_github_browser_login(
 			auth_url = await build_github_oauth_authorize_url(page, account_name)
 			if not auth_url:
 				auth_url = f'{provider_config.domain}{provider_config.github_auth_path}'
-			print(f'[WARN] {account_name}: GitHub OAuth was not triggered from login page, falling back to {auth_url}')
+			print(f'[WARN] {account_name}: GitHub OAuth was not triggered from login page; using direct authorization')
 			initial_session_cookie = await get_session_cookie_value(page, cookie_url=provider_config.domain)
 			await page.goto(auth_url, wait_until='domcontentloaded', timeout=min(timeout_ms, 60_000))
 
@@ -1169,8 +1171,15 @@ def get_user_info(client, headers, user_info_url: str):
 	try:
 		response = client.get(user_info_url, headers=headers, timeout=30)
 
+		if response.status_code == 403:
+			return {'success': False, 'error': 'Balance API returned HTTP 403', 'browser_required': True}
 		if response.status_code == 200:
-			data = response.json()
+			try:
+				data = response.json()
+			except ValueError:
+				return {'success': False, 'error': 'Balance API returned a non-JSON page', 'browser_required': True}
+			if not isinstance(data, dict):
+				return {'success': False, 'error': 'Invalid balance API response'}
 			if data.get('success'):
 				user_data = data.get('data', {})
 				quota = round(user_data.get('quota', 0) / 500000, 2)
@@ -1184,6 +1193,88 @@ def get_user_info(client, headers, user_info_url: str):
 		return {'success': False, 'error': f'Failed to get user info: HTTP {response.status_code}'}
 	except Exception as e:
 		return {'success': False, 'error': f'Failed to get user info: {str(e)[:50]}...'}
+
+
+def live_browser_balance(payload: object, api_user: str | None) -> dict | None:
+	"""Accept only a fresh successful API response for the requested account."""
+	if not isinstance(payload, dict) or payload.get('success') is not True:
+		return None
+	profile = payload.get('data')
+	if not isinstance(profile, dict) or not api_user or str(profile.get('id')) != str(api_user):
+		return None
+	try:
+		quota = float(profile['quota']) / 500_000
+		used_quota = float(profile['used_quota']) / 500_000
+	except (KeyError, TypeError, ValueError):
+		return None
+	if not all(math.isfinite(value) and value >= 0 for value in (quota, used_quota)):
+		return None
+	quota, used_quota = round(quota, 2), round(used_quota, 2)
+	return {
+		'success': True,
+		'quota': quota,
+		'used_quota': used_quota,
+		'display': f':money: Current balance: ${quota}, Used: ${used_quota}',
+		'_live_balance': True,
+	}
+
+
+async def run_browser_user_info_request(account_name: str, provider_config, cookies: dict, api_user: str | None):
+	"""Keep WAF navigation and the balance request inside one isolated browser."""
+	if not api_user or not cookies.get('session'):
+		return None
+	browser = None
+	try:
+		kwargs = {'headless': True, 'humanize': False}
+		proxy = get_playwright_proxy(use_proxy=provider_config.use_proxy)
+		if proxy:
+			kwargs['proxy'] = proxy
+		browser = await launch_async(**kwargs)
+		context = await browser.new_context()
+		await context.add_cookies([
+			{'name': 'session', 'value': cookies['session'], 'url': provider_config.domain}
+		])
+		page = await context.new_page()
+		await page.goto(f'{provider_config.domain}/console', wait_until='domcontentloaded', timeout=60_000)
+		await wait_for_waf_ready(page)
+		payload = await page.evaluate(
+			"""async ({ path, apiUser, headerName }) => {
+				const response = await fetch(path, {
+					credentials: 'include', cache: 'no-store',
+					headers: { Accept: 'application/json', [headerName]: apiUser },
+					signal: AbortSignal.timeout(30000),
+				});
+				if (!response.ok) return null;
+				try { return await response.json(); } catch { return null; }
+			}""",
+			{'path': provider_config.user_info_path, 'apiUser': str(api_user), 'headerName': provider_config.api_user_key},
+		)
+		result = live_browser_balance(payload, api_user)
+		if result:
+			print(f'[INFO] {account_name}: Balance verified in browser')
+		return result
+	except Exception as exc:
+		print(f'[WARN] {account_name}: Browser balance query failed ({type(exc).__name__})')
+		return None
+	finally:
+		if browser is not None:
+			await browser.close()
+
+
+async def query_session_user_info(account, account_name, provider_config, cookies, api_user):
+	if provider_config.domain not in _browser_balance_domains:
+		prepared = await prepare_cookies(account_name, provider_config, cookies)
+		if not prepared:
+			return None
+		result = await asyncio.to_thread(
+			run_user_info_request, prepared, account, account_name, provider_config,
+			api_user_override=api_user, use_proxy=provider_config.use_proxy,
+		)
+		if not result or not result.get('browser_required'):
+			return result
+		_browser_balance_domains.add(provider_config.domain)
+		print(f'[INFO] {account_name}: Switching balance queries to browser after an HTML/403 response')
+	return await run_browser_user_info_request(account_name, provider_config, cookies, api_user)
 
 
 def user_info_from_browser_profile(user_profile: dict | None) -> dict | None:
@@ -1428,18 +1519,10 @@ async def query_previous_session_balance(
 		max_attempt_count = max(max_attempts, 1)
 		for attempt in range(1, max_attempt_count + 1):
 			_set_account_step(1, f'查询签到前余额 {attempt}/{max_attempt_count}')
-			before_cookies = await prepare_cookies(account_name, provider_config, previous_session['cookies'])
-
-			if before_cookies:
-				user_info_before = await asyncio.to_thread(
-					run_user_info_request,
-					before_cookies,
-					account,
-					account_name,
-					provider_config,
-					api_user_override=previous_session.get('api_user'),
-					use_proxy=provider_config.use_proxy,
-				)
+			user_info_before = await query_session_user_info(
+				account, account_name, provider_config, previous_session['cookies'], previous_session.get('api_user')
+			)
+			if user_info_before:
 				if user_info_before and user_info_before.get('success'):
 					if previous_session.get('checkin_date') == datetime.now().date().isoformat():
 						user_info_before['_checked_in_by_script_today'] = True
@@ -1479,7 +1562,7 @@ def user_info_has_balance(user_info: dict | None) -> bool:
 		used_quota = float(user_info['used_quota'])
 	except (KeyError, TypeError, ValueError):
 		return False
-	return quota != 0 or used_quota != 0
+	return (quota != 0 or used_quota != 0) or user_info.get('_live_balance') is True
 
 
 async def query_post_login_balance(
@@ -1500,21 +1583,10 @@ async def query_post_login_balance(
 		max_attempt_count = max(max_attempts, 1)
 		for attempt in range(1, max_attempt_count + 1):
 			_set_account_step(3, f'查询签到后余额 {attempt}/{max_attempt_count}')
-			post_cookies = await prepare_cookies(
-				account_name,
-				provider_config,
-				{'session': session_cookie},
+			user_info = await query_session_user_info(
+				account, account_name, provider_config, {'session': session_cookie}, login_result.api_user
 			)
-			if post_cookies:
-				user_info = await asyncio.to_thread(
-					run_user_info_request,
-					post_cookies,
-					account,
-					account_name,
-					provider_config,
-					api_user_override=login_result.api_user,
-					use_proxy=provider_config.use_proxy,
-				)
+			if user_info:
 				if user_info_has_balance(user_info):
 					if not user_info.get('display'):
 						user_info = {

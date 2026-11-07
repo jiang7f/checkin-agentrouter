@@ -10,6 +10,7 @@ English summary: Local AgentRouter daily check-in automation with multi-account 
 - 每个账号独立保存 GitHub 登录状态
 - 每次重新 GitHub OAuth，可靠触发每日签到
 - 签到前、签到后余额分别重试，不因余额查询失败重复 OAuth
+- 余额接口返回 HTML 或 HTTP 403 时，自动在独立后台浏览器中查询，同一轮后续查询复用该方式；只接受当前 API 返回且账号 ID 匹配的余额
 - 交互终端使用实时多账号进度条
 - 非交互终端使用普通逐行日志，适合 `launchd` 和日志文件
 - 飞书通知余额、签到增量和失败原因
@@ -23,7 +24,7 @@ English summary: Local AgentRouter daily check-in automation with multi-account 
 - [uv](https://docs.astral.sh/uv/)
 - 可正常访问 GitHub 和 AgentRouter 的网络环境
 
-项目当前要求 `cloakbrowser>=0.6.4`，具体安装版本由 `uv.lock` 锁定。
+项目当前要求 `cloakbrowser>=0.6.4,<0.7`，具体安装版本由 `uv.lock` 锁定。
 
 ## 快速开始
 
@@ -325,7 +326,7 @@ checkin-agentrouter add <name>
 
 ### 显示签到成功，但余额获取失败
 
-OAuth 已经成功，签到仍然成立。失败的是签到后余额查询，脚本会最多重试 3 次，不会再次 OAuth。
+OAuth 已经成功，签到仍然成立。失败的是签到后余额查询，脚本会最多重试 3 次，不会再次 OAuth。接口返回 HTML 或 HTTP 403 时会切换到后台浏览器，让验证页面和余额请求使用同一浏览器上下文；不会把登录缓存中的余额作为新查询结果。
 
 ### 没有显示“本次签到 +25”
 
@@ -365,7 +366,7 @@ uv run python -m cloakbrowser info
 
 如果要自行升级 CloakBrowser Python 包，可以执行 `uv sync --upgrade-package cloakbrowser --dev`，然后重新执行上面的 `install` 和 `info` 命令。该操作会更新 `uv.lock`。
 
-Python 包版本和 Chromium 内核版本是两回事。CloakBrowser 0.6.4 在未配置许可证的 macOS 上仍使用 Chromium 145。提示中的 Pro 新内核需要单独登录或配置许可证，升级 Python 包不会自动启用，Pro 提示也不代表依赖更新失败。
+Python 包版本和 Chromium 内核版本是两回事。CloakBrowser 0.6.5 在未配置许可证的 macOS 上仍使用 Chromium 145。提示中的 Pro 新内核需要单独登录或配置许可证，升级 Python 包不会自动启用，Pro 提示也不代表依赖更新失败。
 
 ## 本地状态和安全
 
@@ -397,3 +398,7 @@ uv run pytest -q
 本地版基于 [`millylee/anyrouter-check-in`](https://github.com/millylee/anyrouter-check-in) 修改。
 
 原项目版权和许可证声明见 [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md)。
+
+### 浏览器版本兼容
+
+当前锁定 CloakBrowser 0.6.5，并限制在 0.7 以下。0.7.0 开始要求许可证，不适合直接替换当前无需许可证的多账号后台服务。升级前需单独验证许可证和并发限制。
